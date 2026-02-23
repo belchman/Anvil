@@ -1,0 +1,17 @@
+{
+  "default": "claude-opus-4-6",
+  "overrides": {
+    "routing": "claude-sonnet-4-5-20250929",
+    "review": "claude-sonnet-4-5-20250929",
+    "security": "claude-sonnet-4-5-20250929",
+    "generation": "claude-opus-4-6",
+    "implementation": "claude-opus-4-6",
+    "holdout": "claude-sonnet-4-5-20250929",
+    "healer": "claude-opus-4-6",
+    "supervisor": "claude-sonnet-4-5-20250929"
+  },
+  "cost_weights": {
+    "claude-opus-4-6": 1.0,
+    "claude-sonnet-4-5-20250929": 0.2
+  }
+}

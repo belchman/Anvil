@@ -1,0 +1,52 @@
+digraph pipeline {
+  // Node types: box=phase, diamond=gate, doubleoctagon=supervisor
+  node [shape=box]
+
+  // --- Phases ---
+  phase0 [label="Phase 0: Context Scan"]
+  interrogate [label="Interrogation"]
+  interrogation_review [label="Interrogation Review" shape=diamond]
+  generate_docs [label="Doc Generation"]
+  doc_review [label="Doc Review" shape=diamond]
+  holdout_generate [label="Holdout Generation"]
+  implement [label="Implementation"]
+  verify [label="Verify Gate" shape=diamond]
+  holdout_validate [label="Holdout Validation" shape=diamond]
+  security_audit [label="Security Audit"]
+  ship [label="Ship Gate" shape=diamond]
+  supervisor [label="Supervisor" shape=doubleoctagon]
+
+  // --- Edges with conditions ---
+  phase0 -> interrogate [label="always"]
+  interrogate -> interrogation_review [label="always"]
+
+  // Interrogation review routing
+  interrogation_review -> generate_docs [label="PASS (satisfaction >= 0.7)"]
+  interrogation_review -> interrogate [label="ITERATE (satisfaction 0.5-0.69)" style=dashed]
+  interrogation_review -> BLOCKED [label="NEEDS_HUMAN (critical unknowns)" color=red]
+
+  // Doc generation routing
+  generate_docs -> doc_review [label="always"]
+  doc_review -> holdout_generate [label="PASS (satisfaction >= 0.8)"]
+  doc_review -> generate_docs [label="ITERATE" style=dashed]
+
+  holdout_generate -> implement [label="always"]
+
+  // Implementation loop
+  implement -> verify [label="always"]
+  verify -> implement [label="PASS + more steps"]
+  verify -> holdout_validate [label="PASS + all done"]
+  verify -> implement [label="FAIL (retries < 3)" style=dashed color=orange]
+  verify -> interrogate [label="FAIL (retries >= 3, spec issue)" style=dashed color=red]
+  verify -> BLOCKED [label="FAIL (retries >= 3, code issue)" color=red]
+
+  // Ship path
+  holdout_validate -> security_audit [label="PASS (>= 0.8)"]
+  holdout_validate -> implement [label="FAIL" style=dashed color=orange]
+  security_audit -> ship [label="no blockers"]
+  security_audit -> implement [label="blockers found" style=dashed]
+  ship -> DONE [label="all green"]
+
+  // Supervisor can intercept any edge
+  supervisor -> BLOCKED [label="cost > 80% ceiling" color=red style=bold]
+}

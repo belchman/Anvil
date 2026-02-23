@@ -1,0 +1,36 @@
+{
+  "permissions": {
+    "allow": [
+      "Read",
+      "Write",
+      "Edit",
+      "Glob",
+      "Grep",
+      "WebFetch",
+      "WebSearch",
+      "Task",
+      "Bash(git *)",
+      "Bash(npm test*)",
+      "Bash(npm run *)",
+      "Bash(npx *)",
+      "Bash(pytest*)",
+      "Bash(go test*)",
+      "Bash(go build*)",
+      "Bash(cargo test*)",
+      "Bash(cargo build*)",
+      "Bash(gh *)",
+      "Bash(jq *)",
+      "Bash(mkdir *)",
+      "Bash(chmod *)",
+      "Bash(ls *)",
+      "Bash(cat *)",
+      "Bash(head *)",
+      "Bash(tail *)",
+      "Bash(diff *)",
+      "Bash(wc *)",
+      "Bash(timeout *)",
+      "Bash(scripts/agent-test.sh*)"
+    ],
+    "deny": []
+  }
+}

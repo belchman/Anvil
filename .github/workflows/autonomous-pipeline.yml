@@ -1,0 +1,58 @@
+name: Autonomous Pipeline
+
+on:
+  issues:
+    types: [labeled]
+  workflow_dispatch:
+    inputs:
+      ticket:
+        description: 'Ticket ID or feature description'
+        required: true
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  run-pipeline:
+    if: github.event.label.name == 'agent-ready' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Claude Code
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Determine ticket
+        id: ticket
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "ticket=${{ github.event.inputs.ticket }}" >> $GITHUB_OUTPUT
+          else
+            echo "ticket=${{ github.event.issue.number }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run pipeline
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GITHUB_PAT: ${{ secrets.GITHUB_TOKEN }}
+          AUTONOMOUS_MODE: true
+          MAX_PIPELINE_COST: 50
+        run: |
+          chmod +x run-pipeline.sh
+          ./run-pipeline.sh "${{ steps.ticket.outputs.ticket }}"
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-logs
+          path: docs/artifacts/pipeline-runs/
