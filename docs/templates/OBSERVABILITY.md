@@ -91,3 +91,7 @@
 |-------|----------|----------|---------|
 | App health | /health | 30s | 5s |
 | DB connectivity | | 60s | 10s |
+
+## Related Documents
+- **Feeds into:** [ROLLOUT_PLAN.md](ROLLOUT_PLAN.md)
+- **Informed by:** [SECURITY_CHECKLIST.md](SECURITY_CHECKLIST.md)

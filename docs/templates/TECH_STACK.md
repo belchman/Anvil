@@ -66,3 +66,7 @@
 
 ## Compatibility & Browser Support
 <!-- Target environments, minimum versions -->
+
+## Related Documents
+- **Feeds into:** [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md)
+- **Informed by:** [PRD.md](PRD.md)

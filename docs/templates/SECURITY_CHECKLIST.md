@@ -69,3 +69,7 @@
 | Threat | Severity | Mitigation | Status |
 |--------|----------|------------|--------|
 | | | | |
+
+## Related Documents
+- **Feeds into:** [OBSERVABILITY.md](OBSERVABILITY.md)
+- **Informed by:** [TESTING_PLAN.md](TESTING_PLAN.md)

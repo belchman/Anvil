@@ -80,3 +80,7 @@
 - After every bug fix
 - After security audit findings
 - After holdout validation failures
+
+## Related Documents
+- **Feeds into:** [SECURITY_CHECKLIST.md](SECURITY_CHECKLIST.md)
+- **Informed by:** [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md)

@@ -369,6 +369,22 @@ else
 fi
 
 # ============================================================
+# 11. Doc Template Cross-References
+# ============================================================
+section "Doc Template Cross-References"
+
+for t in "${TEMPLATES[@]}"; do
+  TMPL_FILE="$ROOT/docs/templates/$t.md"
+  if [ -f "$TMPL_FILE" ]; then
+    if grep -q "## Related Documents" "$TMPL_FILE"; then
+      pass "template $t has Related Documents section"
+    else
+      fail "template $t missing Related Documents section"
+    fi
+  fi
+done
+
+# ============================================================
 # Summary
 # ============================================================
 echo ""

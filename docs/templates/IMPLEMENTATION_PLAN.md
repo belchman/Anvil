@@ -82,3 +82,7 @@
 - [ ] Test suite passes
 - [ ] Security audit clean
 - [ ] Documentation updated
+
+## Related Documents
+- **Feeds into:** [TESTING_PLAN.md](TESTING_PLAN.md)
+- **Informed by:** [API_SPEC.md](API_SPEC.md), [TECH_STACK.md](TECH_STACK.md), [FRONTEND_GUIDELINES.md](FRONTEND_GUIDELINES.md), [DATA_MODELS.md](DATA_MODELS.md)

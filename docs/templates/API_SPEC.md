@@ -73,3 +73,7 @@
 | Service | Base URL | Auth | Rate Limit |
 |---------|----------|------|------------|
 | | | | |
+
+## Related Documents
+- **Feeds into:** [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md)
+- **Informed by:** [DATA_MODELS.md](DATA_MODELS.md)

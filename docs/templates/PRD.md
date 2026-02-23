@@ -55,3 +55,7 @@
 
 ## Open Questions
 <!-- Unresolved items that need answers before or during implementation -->
+
+## Related Documents
+- **Feeds into:** [APP_FLOW.md](APP_FLOW.md), [TECH_STACK.md](TECH_STACK.md)
+- **Informed by:** Interrogation summary

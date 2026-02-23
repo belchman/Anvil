@@ -83,3 +83,6 @@
 - [ ] No error rate spike
 - [ ] Key user flows verified
 - [ ] Performance within baseline
+
+## Related Documents
+- **Informed by:** [TESTING_PLAN.md](TESTING_PLAN.md), [SECURITY_CHECKLIST.md](SECURITY_CHECKLIST.md), [OBSERVABILITY.md](OBSERVABILITY.md)
