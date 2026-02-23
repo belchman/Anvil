@@ -64,3 +64,13 @@ MAX_NO_PROGRESS=3  # consecutive impl phases without git commits -> stall
 
 # Context window target (tokens)
 CONTEXT_WINDOW=200000
+
+# Guard: ensure no timeout is zero (would cause immediate timeout)
+for _t_var in TIMEOUT_PHASE0 TIMEOUT_INTERROGATE TIMEOUT_REVIEW TIMEOUT_GENERATE_DOCS \
+  TIMEOUT_IMPLEMENT TIMEOUT_VERIFY TIMEOUT_SECURITY TIMEOUT_HOLDOUT TIMEOUT_SHIP; do
+  if [ "${!_t_var}" -eq 0 ] 2>/dev/null; then
+    echo "[WARN] ${_t_var}=0 would cause immediate timeout, setting to 60"
+    eval "${_t_var}=60"
+  fi
+done
+unset _t_var

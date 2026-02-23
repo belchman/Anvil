@@ -33,6 +33,48 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/pipeline.config.sh"
 
+# Validate numeric config values
+for _cfg_var in MAX_PIPELINE_COST MAX_VERIFY_RETRIES MAX_INTERROGATION_ITERATIONS \
+  STAGNATION_SIMILARITY_THRESHOLD MAX_NO_PROGRESS CONTEXT_WINDOW \
+  TURNS_PHASE0 TURNS_INTERROGATE TURNS_REVIEW TURNS_GENERATE_DOCS TURNS_IMPLEMENT \
+  TURNS_VERIFY TURNS_SECURITY TURNS_HOLDOUT TURNS_SHIP \
+  BUDGET_PHASE0 BUDGET_INTERROGATE BUDGET_REVIEW BUDGET_GENERATE_DOCS BUDGET_IMPLEMENT \
+  BUDGET_VERIFY BUDGET_SECURITY BUDGET_HOLDOUT BUDGET_SHIP \
+  TIMEOUT_PHASE0 TIMEOUT_INTERROGATE TIMEOUT_REVIEW TIMEOUT_GENERATE_DOCS \
+  TIMEOUT_IMPLEMENT TIMEOUT_VERIFY TIMEOUT_SECURITY TIMEOUT_HOLDOUT TIMEOUT_SHIP; do
+  if ! [[ "${!_cfg_var:-}" =~ ^[0-9]+\.?[0-9]*$ ]]; then
+    echo "[ERROR] Config variable $_cfg_var is not numeric: '${!_cfg_var:-}'"
+    exit 1
+  fi
+done
+unset _cfg_var
+
+# ---- Helper Functions ----
+
+safe_jq() {
+  local file="$1" query="$2" fallback="${3:-}"
+  if [ ! -f "$file" ]; then
+    echo "$fallback"
+    return
+  fi
+  local result
+  result=$(jq -r "$query" "$file" 2>/dev/null) || { echo "$fallback"; return; }
+  if [ -z "$result" ] || [ "$result" = "null" ]; then
+    echo "$fallback"
+    return
+  fi
+  echo "$result"
+}
+
+validate_numeric() {
+  local value="$1" fallback="${2:-0}"
+  if [[ "$value" =~ ^-?[0-9]+\.?[0-9]*$ ]]; then
+    echo "$value"
+  else
+    echo "$fallback"
+  fi
+}
+
 # ---- Arguments ----
 if [ -z "${1:-}" ]; then
   echo "Usage: ./run-pipeline.sh TICKET-ID [--resume LOG_DIR]" >&2
@@ -51,8 +93,8 @@ if [ "${2:-}" = "--resume" ] && [ -n "${3:-}" ]; then
   RESUME_FROM="$3"
   CHECKPOINT_DIR="$3"
   if [ -f "${CHECKPOINT_DIR}/checkpoint.json" ]; then
-    RESUME_PHASE=$(jq -r '.current_phase' "${CHECKPOINT_DIR}/checkpoint.json")
-    TOTAL_COST=$(jq -r '.total_cost' "${CHECKPOINT_DIR}/checkpoint.json")
+    RESUME_PHASE=$(safe_jq "${CHECKPOINT_DIR}/checkpoint.json" '.current_phase' "phase0")
+    TOTAL_COST=$(safe_jq "${CHECKPOINT_DIR}/checkpoint.json" '.total_cost' "0")
     LOG_DIR="$CHECKPOINT_DIR"
     CHECKPOINT_FILE="${LOG_DIR}/checkpoint.json"
     COST_LOG="${LOG_DIR}/costs.json"
@@ -75,10 +117,10 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
 
-log() { echo -e "[$(date +%H:%M:%S)] $1"; }
-log_phase() { echo -e "\n${GREEN}========== $1 ==========${NC}\n"; }
-log_warn() { echo -e "${YELLOW}[WARN] $1${NC}"; }
-log_error() { echo -e "${RED}[ERROR] $1${NC}"; }
+log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$1"; }
+log_phase() { printf '\n%s========== %s ==========%s\n\n' "$GREEN" "$1" "$NC"; }
+log_warn() { printf '%s[WARN] %s%s\n' "$YELLOW" "$1" "$NC"; }
+log_error() { printf '%s[ERROR] %s%s\n' "$RED" "$1" "$NC"; }
 
 # ---- Thread Management (Step 6) ----
 # Thread IDs control session reuse:
@@ -114,7 +156,10 @@ check_kill_switch() {
 }
 
 check_cost_ceiling() {
-  if (( $(echo "$TOTAL_COST > $MAX_PIPELINE_COST" | bc -l) )); then
+  local cost_exceeded
+  cost_exceeded=$(echo "$TOTAL_COST > $MAX_PIPELINE_COST" | bc -l 2>/dev/null) || cost_exceeded=0
+  cost_exceeded=$(validate_numeric "$cost_exceeded" "0")
+  if [ "$cost_exceeded" -eq 1 ]; then
     log_error "Cost ceiling exceeded: \$${TOTAL_COST} > \$${MAX_PIPELINE_COST}"
     update_checkpoint "cost_exceeded" "$1"
     exit 1
@@ -145,6 +190,13 @@ PHASE_ORDER=(phase0 interrogate interrogation-review generate-docs doc-review ho
 
 should_run_phase() {
   local phase="$1"
+  local known=false
+  for p in "${PHASE_ORDER[@]}"; do
+    if [ "$p" = "$phase" ]; then known=true; break; fi
+  done
+  if [ "$known" = false ]; then
+    log_warn "Unknown phase name: $phase (not in PHASE_ORDER)"
+  fi
   if [ -z "$RESUME_FROM" ]; then
     return 0  # Not resuming, run everything
   fi
@@ -166,7 +218,7 @@ should_run_phase() {
   fi
   # Also skip if this specific phase completed in the cost log
   local completed
-  completed=$(jq -r ".phases[] | select(.name==\"$phase\") | .name" "$COST_LOG" 2>/dev/null || true)
+  completed=$(safe_jq "$COST_LOG" ".phases[] | select(.name==\"$phase\") | .name" "")
   if [ -n "$completed" ]; then
     log "Skipping $phase (already completed in previous run)"
     return 1
@@ -189,7 +241,8 @@ select_fidelity() {
   fi
 
   local utilization
-  utilization=$(echo "($estimated_tokens * 100) / $window_size" | bc -l | cut -d. -f1)
+  utilization=$(echo "($estimated_tokens * 100) / $window_size" | bc -l 2>/dev/null | cut -d. -f1)
+  utilization=$(validate_numeric "$utilization" "50")
 
   if [ "$utilization" -gt 60 ]; then
     # Downgrade fidelity (less context)
@@ -220,8 +273,11 @@ select_fidelity() {
 parse_satisfaction() {
   local json_file="$1"
   local result
-  result=$(jq -r '.result // ""' "$json_file" 2>/dev/null)
-  echo "$result" | grep -oP '"aggregate"\s*:\s*\K[0-9.]+' || echo "0"
+  result=$(safe_jq "$json_file" '.result // ""' "")
+  local score
+  score=$(echo "$result" | grep -oP '"aggregate"\s*:\s*\K[0-9.]+' || echo "0")
+  score=$(validate_numeric "$score" "0")
+  echo "$score"
 }
 
 score_to_verdict() {
@@ -263,8 +319,8 @@ IMPORTANT: When evaluating sections, read them in REVERSE order (last section fi
 
   # Compare verdicts - use stricter when they disagree
   local v1 v2
-  v1=$(jq -r '.result // ""' "${LOG_DIR}/${review_name}-pass1.json" 2>/dev/null | grep -oP 'VERDICT: \K\w+' || echo "UNKNOWN")
-  v2=$(jq -r '.result // ""' "${LOG_DIR}/${review_name}-pass2.json" 2>/dev/null | grep -oP 'VERDICT: \K\w+' || echo "UNKNOWN")
+  v1=$(safe_jq "${LOG_DIR}/${review_name}-pass1.json" '.result // ""' "" | grep -oP 'VERDICT: \K\w+' || echo "UNKNOWN")
+  v2=$(safe_jq "${LOG_DIR}/${review_name}-pass2.json" '.result // ""' "" | grep -oP 'VERDICT: \K\w+' || echo "UNKNOWN")
 
   if [ "$v1" = "$v2" ]; then
     echo "$v1"  # Consistent verdict
@@ -286,6 +342,7 @@ route_from_gate() {
   local gate="$1"
   local verdict="$2"
   local retries="${3:-0}"
+  retries=$(validate_numeric "$retries" "0")
 
   case "${gate}:${verdict}" in
     "interrogation-review:PASS"|"interrogation-review:AUTO_PASS"|"interrogation-review:PASS_WITH_NOTES")
@@ -299,7 +356,7 @@ route_from_gate() {
     "doc-review:ITERATE")
       echo "generate-docs" ;;
     "verify:PASS"|"verify:AUTO_PASS"|"verify:PASS_WITH_NOTES")
-      echo "next-step-or-holdout" ;;
+      echo "next-step-or-holdout" ;;  # Resolved by impl loop: next step or holdout-validate if all steps done
     "verify:FAIL"|"verify:ITERATE")
       if [ "$retries" -ge "$MAX_VERIFY_RETRIES" ]; then
         echo "BLOCKED"
@@ -315,8 +372,7 @@ route_from_gate() {
       echo "ship" ;;
     "security-audit:FAIL")
       echo "implement" ;;
-    *)
-      echo "BLOCKED" ;;
+    *) log_warn "Unknown gate:verdict combination: ${gate}:${verdict}"; echo "BLOCKED" ;;
   esac
 }
 
@@ -331,11 +387,11 @@ NO_PROGRESS_COUNT=0
 check_git_progress() {
   local phase_name="$1"
   local current_commit
-  current_commit=$(git rev-parse HEAD 2>/dev/null || echo "none")
+  current_commit=$(git rev-parse HEAD 2>/dev/null || echo "")
 
   # Implementation and security-fix phases MUST produce commits
   if [[ "$phase_name" == implement* ]] || [[ "$phase_name" == security-fix* ]]; then
-    if [ "$current_commit" = "$LAST_COMMIT" ] && [ "$LAST_COMMIT" != "" ]; then
+    if [ "$current_commit" = "$LAST_COMMIT" ] && [ -n "$LAST_COMMIT" ]; then
       log_warn "No new git commits after $phase_name - agent may not have made changes"
       return 1
     fi
@@ -379,13 +435,16 @@ run_phase() {
   # Strip attempt/step/version suffixes but preserve base phase name
   # e.g. "implement-step-1-attempt-2" → "IMPLEMENT", "generate-docs-v2" → "GENERATE_DOCS"
   local phase_timeout="${PHASE_TIMEOUT:-600}"
-  local base_phase
-  base_phase=$(echo "$phase_name" | sed 's/-v[0-9]*$//' | sed 's/-attempt-[0-9]*$//' | sed 's/-step-[0-9a-z-]*$//' | sed 's/-pass[0-9]*$//')
+  local base_phase="${phase_name%%-v[0-9]*}"
+  base_phase="${base_phase%%-attempt-[0-9]*}"
+  base_phase="${base_phase%%-step-[0-9a-z-]*}"
+  base_phase="${base_phase%%-pass[0-9]*}"
   local upper_phase
   upper_phase=$(echo "$base_phase" | tr '[:lower:]-' '[:upper:]_')
   local timeout_var="TIMEOUT_${upper_phase}"
-  if [ -n "${!timeout_var:-}" ]; then
+  if declare -p "$timeout_var" &>/dev/null; then
     phase_timeout="${!timeout_var}"
+    phase_timeout=$(validate_numeric "$phase_timeout" "600")
   fi
 
   # Run Claude in headless mode with structured output (Step 8: wrapped with timeout)
@@ -408,12 +467,14 @@ run_phase() {
 
   # Extract cost and session info
   local phase_cost session_id is_error num_turns
-  phase_cost=$(jq -r '.total_cost_usd // 0' "$output_file" 2>/dev/null || echo "0")
-  session_id=$(jq -r '.session_id // "unknown"' "$output_file" 2>/dev/null || echo "unknown")
-  is_error=$(jq -r '.is_error // false' "$output_file" 2>/dev/null || echo "false")
-  num_turns=$(jq -r '.num_turns // 0' "$output_file" 2>/dev/null || echo "0")
+  phase_cost=$(safe_jq "$output_file" '.total_cost_usd // 0' "0")
+  session_id=$(safe_jq "$output_file" '.session_id // "unknown"' "unknown")
+  is_error=$(safe_jq "$output_file" '.is_error // false' "false")
+  num_turns=$(safe_jq "$output_file" '.num_turns // 0' "0")
 
-  TOTAL_COST=$(echo "$TOTAL_COST + $phase_cost" | bc -l)
+  local new_total
+  new_total=$(echo "$TOTAL_COST + $phase_cost" | bc -l 2>/dev/null) || new_total="$TOTAL_COST"
+  TOTAL_COST=$(validate_numeric "$new_total" "$TOTAL_COST")
 
   # Log cost
   log "Phase: $phase_name | Cost: \$${phase_cost} | Turns: ${num_turns} | Total: \$${TOTAL_COST}"
@@ -421,13 +482,19 @@ run_phase() {
   # Append to cost log (JSON)
   local tmp
   tmp=$(mktemp)
-  jq --arg name "$phase_name" \
-     --argjson cost "$phase_cost" \
+  trap "rm -f '$tmp'" RETURN
+  if jq --arg name "$phase_name" \
+     --argjson cost "${phase_cost}" \
      --arg sid "$session_id" \
-     --argjson turns "$num_turns" \
-     --argjson total "$TOTAL_COST" \
+     --argjson turns "${num_turns}" \
+     --argjson total "${TOTAL_COST}" \
      '.phases += [{"name":$name,"cost":$cost,"session_id":$sid,"turns":$turns}] | .total_cost=$total' \
-     "$COST_LOG" > "$tmp" && mv "$tmp" "$COST_LOG"
+     "$COST_LOG" > "$tmp" 2>/dev/null; then
+    mv "$tmp" "$COST_LOG"
+  else
+    log_warn "Failed to update cost log for phase $phase_name"
+    rm -f "$tmp"
+  fi
 
   # Check for errors
   if [ "$exit_code" -ne 0 ] || [ "$is_error" = "true" ]; then
@@ -454,15 +521,15 @@ check_stagnation() {
     if [ -f "$prev" ] && [ -f "$curr" ]; then
       # Compare checksums first (identical files = definite stagnation)
       local prev_sum curr_sum
-      prev_sum=$(cksum "$prev" | awk '{print $1}')
-      curr_sum=$(cksum "$curr" | awk '{print $1}')
+      prev_sum=$(cksum "$prev" 2>/dev/null | awk '{print $1}')
+      curr_sum=$(cksum "$curr" 2>/dev/null | awk '{print $1}')
       if [ "$prev_sum" = "$curr_sum" ]; then
         log_warn "Stagnation detected: attempt $attempt errors are identical to attempt $((attempt-1))"
         return 1
       fi
       # For non-identical files, check if diff is < 10% of total lines
       local diff_lines total
-      diff_lines=$(diff "$prev" "$curr" | grep -c '^[<>]' || true)
+      diff_lines=$(diff "$prev" "$curr" 2>/dev/null | grep -c '^[<>]' || true)
       total=$(wc -l < "$curr")
       if [ "$total" -gt 0 ] && [ "$diff_lines" -lt $((total / 10)) ]; then
         log_warn "Stagnation detected: attempt $attempt errors are >90% similar to attempt $((attempt-1))"
@@ -572,7 +639,7 @@ if should_run_phase "generate-docs"; then
       60 15 "--model $MODEL_GENERATE_DOCS"
   else
     # Fallback: sequential generation (bash backgrounding is unreliable for claude -p)
-    # TODO: When Agent Teams becomes GA, remove this fallback branch
+    # Sequential doc generation: Agent Teams not detected
     run_phase "generate-docs" \
       "You are running the Interrogation Protocol pipeline autonomously.
 
@@ -634,7 +701,9 @@ fi
 # before any code is written.
 
 if should_run_phase "holdout-generate"; then
-  if ! ls .holdouts/holdout-001-*.md 1>/dev/null 2>&1; then
+  if [ -d ".holdouts" ] && ls .holdouts/holdout-001-*.md 1>/dev/null 2>&1; then
+    log "Holdouts already exist, skipping generation."
+  else
     run_phase "holdout-generate" \
       "You are the HOLDOUT GENERATOR agent. You operate in COMPLETE ISOLATION from implementation.
 
@@ -650,8 +719,6 @@ Generate 8-12 adversarial test scenarios that:
 Write each to .holdouts/holdout-NNN-[slug].md using the standard format.
 Start numbering at 001." \
       "$TURNS_HOLDOUT" "$BUDGET_HOLDOUT" "--model $MODEL_HOLDOUT"
-  else
-    log "Holdouts already exist, skipping generation."
   fi
 fi
 
@@ -659,11 +726,24 @@ fi
 
 if should_run_phase "implement"; then
   # Read implementation steps from the plan
-  IMPL_STEPS=$(claude -p "Read docs/IMPLEMENTATION_PLAN.md and output ONLY a JSON array of step objects: [{\"id\": \"step-1\", \"title\": \"...\", \"description\": \"...\"}]. Output valid JSON only, no markdown fences." \
-    --output-format json --max-turns 5 --max-budget-usd 1 2>/dev/null | jq -r '.result // ""' | grep -oP '\[.*\]' || echo "[]")
+  raw_result=$(claude -p "Read docs/IMPLEMENTATION_PLAN.md and output ONLY a JSON array of step objects: [{\"id\": \"step-1\", \"title\": \"...\", \"description\": \"...\"}]. Output valid JSON only, no markdown fences." \
+    --output-format json --max-turns 5 --max-budget-usd 1 2>/dev/null)
+  result_text=$(echo "$raw_result" | jq -r '.result // ""' 2>/dev/null || echo "")
+  # Try to extract JSON array - first try direct parse, then regex extraction
+  IMPL_STEPS=$(echo "$result_text" | jq -c '.' 2>/dev/null || echo "$result_text" | grep -oP '\[.*\]' 2>/dev/null || echo "[]")
+  # Validate it's actually a JSON array
+  if ! echo "$IMPL_STEPS" | jq 'type == "array"' 2>/dev/null | grep -q true; then
+    IMPL_STEPS="[]"
+  fi
 
   STEP_COUNT=$(echo "$IMPL_STEPS" | jq 'length' 2>/dev/null || echo "0")
+  STEP_COUNT=$(validate_numeric "$STEP_COUNT" "0")
   log "Implementation plan has $STEP_COUNT steps"
+
+  if [ "$STEP_COUNT" -gt 50 ]; then
+    log_warn "STEP_COUNT ($STEP_COUNT) exceeds maximum of 50, capping"
+    STEP_COUNT=50
+  fi
 
   if [ "$STEP_COUNT" -eq 0 ]; then
     log_error "No implementation steps found. Check docs/IMPLEMENTATION_PLAN.md exists and has steps."
@@ -671,9 +751,9 @@ if should_run_phase "implement"; then
   fi
 
   for i in $(seq 0 $((STEP_COUNT - 1))); do
-    STEP_ID=$(echo "$IMPL_STEPS" | jq -r ".[$i].id")
-    STEP_TITLE=$(echo "$IMPL_STEPS" | jq -r ".[$i].title")
-    STEP_DESC=$(echo "$IMPL_STEPS" | jq -r ".[$i].description")
+    STEP_ID=$(echo "$IMPL_STEPS" | jq -r ".[$i].id // \"step-$((i+1))\"")
+    STEP_TITLE=$(echo "$IMPL_STEPS" | jq -r ".[$i].title // \"Untitled step\"")
+    STEP_DESC=$(echo "$IMPL_STEPS" | jq -r ".[$i].description // \"No description\"")
 
     log_phase "Implementing: $STEP_ID - $STEP_TITLE"
 
@@ -744,6 +824,7 @@ Always include VERDICT: [PASS|FAIL] as the last line." \
       set -e
 
       VERIFY_VERDICT=$(jq -r '.result // ""' "${LOG_DIR}/verify-${STEP_ID}-attempt-${attempt}.json" 2>/dev/null | grep -oP 'VERDICT: \K\w+' || echo "UNKNOWN")
+      case "$VERIFY_VERDICT" in PASS|AUTO_PASS|PASS_WITH_NOTES|FAIL|ITERATE|UNKNOWN) ;; *) log_warn "Unexpected verify verdict: $VERIFY_VERDICT"; VERIFY_VERDICT="UNKNOWN" ;; esac
 
       if [ "$VERIFY_VERDICT" = "PASS" ]; then
         log "Step $STEP_ID verified on attempt $attempt"
@@ -762,8 +843,10 @@ STAGNATION DETECTED: Your previous fix attempts are producing the same errors. T
       if [ "$attempt" -eq "$MAX_VERIFY_RETRIES" ]; then
         log_error "Step $STEP_ID failed after $MAX_VERIFY_RETRIES attempts. Blocking."
         update_checkpoint "blocked" "verify-${STEP_ID}"
-        echo "BLOCKED: Step ${STEP_ID} failed ${MAX_VERIFY_RETRIES} verification attempts." > "${LOG_DIR}/blocked-${STEP_ID}.txt"
-        echo "See verify logs for details." >> "${LOG_DIR}/blocked-${STEP_ID}.txt"
+        if ! echo "BLOCKED: Step ${STEP_ID} failed ${MAX_VERIFY_RETRIES} verification attempts." > "${LOG_DIR}/blocked-${STEP_ID}.txt"; then
+          log_warn "Failed to write blocked status file"
+        fi
+        echo "See verify logs for details." >> "${LOG_DIR}/blocked-${STEP_ID}.txt" 2>/dev/null
         exit 3
       fi
     done
@@ -791,6 +874,7 @@ Always include VERDICT: [PASS|FAIL] as the last line." \
       "$TURNS_HOLDOUT" "$BUDGET_HOLDOUT" "--model $MODEL_HOLDOUT"
 
     HOLDOUT_VERDICT=$(jq -r '.result // ""' "${LOG_DIR}/holdout-validate.json" 2>/dev/null | grep -oP 'VERDICT: \K\w+' || echo "UNKNOWN")
+    case "$HOLDOUT_VERDICT" in PASS|AUTO_PASS|PASS_WITH_NOTES|FAIL|UNKNOWN) ;; *) log_warn "Unexpected holdout verdict: $HOLDOUT_VERDICT"; HOLDOUT_VERDICT="UNKNOWN" ;; esac
     HOLDOUT_NEXT=$(route_from_gate "holdout-validate" "$HOLDOUT_VERDICT")
 
     if [ "$HOLDOUT_NEXT" = "implement" ]; then
@@ -868,10 +952,13 @@ echo ""
 log_phase "PIPELINE COMPLETE"
 echo ""
 log "Ticket: $TICKET"
-log "Total cost: \$$(printf '%.2f' "$TOTAL_COST")"
+display_cost=$(validate_numeric "$TOTAL_COST" "0")
+log "Total cost: \$$(printf '%.2f' "$display_cost")"
 log "Logs: $LOG_DIR"
 log "Cost breakdown:"
-jq -r '.phases[] | "  \(.name): $\(.cost) (\(.turns) turns)"' "$COST_LOG"
+if [ -f "$COST_LOG" ]; then
+  jq -r '.phases[] | "  \(.name): $\(.cost) (\(.turns) turns)"' "$COST_LOG" 2>/dev/null || log_warn "Could not parse cost log"
+fi
 echo ""
 log "Checkpoint: $CHECKPOINT_FILE"
 log "Full cost log: $COST_LOG"
