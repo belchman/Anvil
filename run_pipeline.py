@@ -7,11 +7,15 @@ Install: pip install claude-agent-sdk-python
 Usage: python run_pipeline.py "TICKET-ID"
 """
 import asyncio
+import difflib
+import hashlib
 import json
+import random
 import re
 import subprocess
 import sys
 import os
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -43,6 +47,101 @@ MODELS = {
 MAX_VERIFY_RETRIES = 3
 MAX_INTERROGATION_ITERATIONS = 2
 STAGNATION_SIMILARITY_THRESHOLD = 0.90
+
+# Module-level config dict, populated from pipeline.config.sh in main()
+_config: dict[str, str] = {}
+
+# Phase ordering for resume support
+PHASE_ORDER = [
+    "phase0", "interrogate", "interrogation-review", "generate-docs",
+    "doc-review", "holdout-generate", "implement", "holdout-validate",
+    "security-audit", "ship",
+]
+
+
+# --- Config Loader ---
+
+def load_bash_config(config_path: Path) -> dict[str, str]:
+    """Parse KEY=VALUE lines from a bash config file."""
+    config: dict[str, str] = {}
+    if not config_path.exists():
+        return config
+    for line in config_path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" in line and not line.startswith("for ") and not line.startswith("if "):
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key.isidentifier():
+                config[key] = value
+    return config
+
+
+def get_config_int(config: dict[str, str], key: str, default: int) -> int:
+    try:
+        return int(config.get(key, str(default)))
+    except ValueError:
+        return default
+
+
+def get_config_float(config: dict[str, str], key: str, default: float) -> float:
+    try:
+        return float(config.get(key, str(default)))
+    except ValueError:
+        return default
+
+
+# --- Dynamic Fidelity Selection ---
+
+def select_fidelity(default_mode: str, estimated_tokens: int = 0, window_size: int = 200000) -> str:
+    """Auto-adjust fidelity based on context utilization."""
+    if estimated_tokens <= 0:
+        return default_mode
+
+    utilization = (estimated_tokens * 100) // window_size
+
+    DOWNGRADE = {
+        "full": "truncate", "truncate": "summary:low",
+        "summary:low": "summary:medium", "summary:medium": "summary:high",
+        "summary:high": "compact",
+    }
+    UPGRADE = {
+        "compact": "summary:high", "summary:high": "summary:medium",
+        "summary:medium": "summary:low",
+    }
+
+    if utilization > 60:
+        return DOWNGRADE.get(default_mode, "compact")
+    elif utilization < 30:
+        return UPGRADE.get(default_mode, default_mode)
+    return default_mode
+
+
+# --- Agent Teams Detection ---
+
+def has_agent_teams() -> bool:
+    """Check if Claude CLI supports agent teams."""
+    try:
+        output = subprocess.check_output(
+            ["claude", "--version"], stderr=subprocess.DEVNULL, text=True
+        )
+        return "agent-teams" in output
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False
+
+
+# --- Per-Phase Timeouts ---
+
+def get_phase_timeout(config: dict[str, str], phase_name: str) -> int:
+    """Get timeout for a phase, stripping suffixes to match config keys."""
+    base = re.sub(r'-v\d+$', '', phase_name)
+    base = re.sub(r'-attempt-\d+$', '', base)
+    base = re.sub(r'-step-[\da-z-]+$', '', base)
+    base = re.sub(r'-pass\d+$', '', base)
+    upper = base.upper().replace("-", "_")
+    return get_config_int(config, f"TIMEOUT_{upper}", 600)
 
 
 # --- Data Types ---
@@ -77,12 +176,57 @@ class ImplStep:
 
 
 @dataclass
+class ProgressTracker:
+    """Cross-phase git progress tracking."""
+    last_commit: str = ""
+    no_progress_count: int = 0
+    max_no_progress: int = 3
+
+    def check(self, phase_name: str) -> bool:
+        """Check git progress. Returns False if stalled."""
+        current = get_git_head()
+        if phase_name.startswith("implement") or phase_name.startswith("security-fix"):
+            if current == self.last_commit and self.last_commit:
+                self.no_progress_count += 1
+                print(f"  [WARN] No git commits after {phase_name} ({self.no_progress_count} consecutive)")
+                if self.no_progress_count >= self.max_no_progress:
+                    return False
+            else:
+                self.no_progress_count = 0
+        self.last_commit = current
+        return True
+
+
+@dataclass
+class ThreadManager:
+    """Track thread IDs per phase for session management."""
+    threads: dict[str, str] = field(default_factory=dict)
+
+    @staticmethod
+    def generate_id() -> str:
+        return f"thread-{int(time.time())}-{random.randint(1000, 9999)}"
+
+    def get_or_create(self, phase: str) -> str:
+        if phase not in self.threads:
+            self.threads[phase] = self.generate_id()
+        return self.threads[phase]
+
+    def fork(self, parent: str) -> str:
+        child_id = self.generate_id()
+        # In Agent SDK, sessions are managed differently,
+        # but we track the lineage for logging
+        self.threads[f"fork-{child_id}"] = child_id
+        return child_id
+
+
+@dataclass
 class PipelineState:
     ticket: str
     status: str = "running"
     current_phase: str = ""
     total_cost: float = 0.0
     max_cost: float = 50.0
+    resume_phase: str = ""
     phases: list[PhaseResult] = field(default_factory=list)
     log_dir: Path = field(default_factory=lambda: Path("docs/artifacts/pipeline-runs") / datetime.now().strftime("%Y-%m-%d-%H%M"))
     kill_switch: Path = Path(".pipeline-kill")
@@ -94,6 +238,30 @@ class PipelineState:
     def check_cost_ceiling(self):
         if self.total_cost > self.max_cost:
             raise RuntimeError(f"Cost ceiling exceeded: ${self.total_cost:.2f} > ${self.max_cost:.2f}")
+
+    def should_run_phase(self, phase: str) -> bool:
+        """Check if phase should run (skip completed phases when resuming)."""
+        if not self.resume_phase:
+            return True
+
+        # Skip phases before resume point
+        reached_resume = False
+        for p in PHASE_ORDER:
+            if p == self.resume_phase:
+                reached_resume = True
+            if p == phase:
+                if not reached_resume:
+                    print(f"  Skipping {phase} (before resume point: {self.resume_phase})")
+                    return False
+                break
+
+        # Skip already-completed phases
+        completed_phases = {p.name for p in self.phases}
+        if phase in completed_phases:
+            print(f"  Skipping {phase} (already completed)")
+            return False
+
+        return True
 
     def save_checkpoint(self):
         self.log_dir.mkdir(parents=True, exist_ok=True)
@@ -111,6 +279,7 @@ class PipelineState:
         (self.log_dir / "checkpoint.json").write_text(json.dumps(checkpoint, indent=2))
 
     def save_costs(self):
+        """Save costs atomically using temp file + rename."""
         self.log_dir.mkdir(parents=True, exist_ok=True)
         costs = {
             "phases": [
@@ -121,7 +290,10 @@ class PipelineState:
             "status": self.status,
             "started": self.phases[0].name if self.phases else "unknown",
         }
-        (self.log_dir / "costs.json").write_text(json.dumps(costs, indent=2))
+        cost_file = self.log_dir / "costs.json"
+        tmp_file = cost_file.with_suffix(".json.tmp")
+        tmp_file.write_text(json.dumps(costs, indent=2))
+        tmp_file.rename(cost_file)
 
 
 # --- Parsing Helpers ---
@@ -164,6 +336,38 @@ def get_git_head() -> str:
         ).strip()
     except (subprocess.CalledProcessError, FileNotFoundError):
         return "none"
+
+
+# --- Stagnation Detection ---
+
+def check_stagnation(log_dir: Path, phase_name: str, attempt: int) -> bool:
+    """Check if consecutive attempts produce identical/near-identical errors.
+    Returns True if stagnation detected."""
+    if attempt <= 1:
+        return False
+
+    prev = log_dir / f"{phase_name}-attempt-{attempt - 1}.json"
+    curr = log_dir / f"{phase_name}-attempt-{attempt}.json"
+
+    if not prev.exists() or not curr.exists():
+        return False
+
+    prev_text = prev.read_text()
+    curr_text = curr.read_text()
+
+    # Exact match check (checksum)
+    if hashlib.md5(prev_text.encode()).hexdigest() == hashlib.md5(curr_text.encode()).hexdigest():
+        print(f"  [WARN] Stagnation: attempt {attempt} output identical to attempt {attempt - 1}")
+        return True
+
+    # Similarity check using difflib
+    similarity = difflib.SequenceMatcher(None, prev_text, curr_text).ratio()
+    threshold = STAGNATION_SIMILARITY_THRESHOLD
+    if similarity >= threshold:
+        print(f"  [WARN] Stagnation: attempt {attempt} is {similarity:.0%} similar (threshold: {threshold:.0%})")
+        return True
+
+    return False
 
 
 # --- Phase Runner ---
@@ -245,6 +449,53 @@ async def run_phase(state: PipelineState, config: PhaseConfig) -> PhaseResult:
     return phase_result
 
 
+# --- Bias Check (Dual-Pass Review) ---
+
+async def run_review_with_bias_check(
+    state: PipelineState,
+    review_name: str,
+    prompt_base: str,
+    model: str,
+    max_turns: int = 20,
+    max_budget_usd: float = 3.0,
+) -> str:
+    """Dual-pass review with position bias mitigation. Returns verdict."""
+    # Pass 1: normal order
+    pass1 = await run_phase(state, PhaseConfig(
+        name=f"{review_name}-pass1",
+        prompt=prompt_base,
+        model=model,
+        max_turns=max_turns,
+        max_budget_usd=max_budget_usd,
+    ))
+
+    # Pass 2: reversed section order + cross-model
+    swapped_prompt = (
+        prompt_base + "\n\nIMPORTANT: When evaluating sections, read them in "
+        "REVERSE order (last section first). This reduces position bias."
+    )
+    pass2_model = MODELS["implement"] if model == MODELS["review"] else MODELS["review"]
+    pass2 = await run_phase(state, PhaseConfig(
+        name=f"{review_name}-pass2",
+        prompt=swapped_prompt,
+        model=pass2_model,
+        max_turns=max_turns,
+        max_budget_usd=max_budget_usd,
+    ))
+
+    v1, v2 = pass1.verdict, pass2.verdict
+
+    if v1 == v2:
+        return v1
+
+    # Stricter verdict wins
+    print(f"  [WARN] Position bias: pass1={v1}, pass2={v2}. Using stricter.")
+    for strict in ("FAIL", "ITERATE", "NEEDS_HUMAN"):
+        if v1 == strict or v2 == strict:
+            return strict
+    return v1
+
+
 # --- Routing ---
 
 def route_from_gate(gate: str, verdict: str, retries: int = 0) -> str:
@@ -320,28 +571,38 @@ async def implement_and_verify(
     state: PipelineState,
     step: ImplStep,
     ticket: str,
+    progress: ProgressTracker | None = None,
 ) -> bool:
     """Implement a single step with retry loop. Returns True if verified."""
-    last_commit = get_git_head()
-    no_progress_count = 0
+    if progress is None:
+        progress = ProgressTracker()
 
     for attempt in range(1, MAX_VERIFY_RETRIES + 1):
         state.check_kill_switch()
         state.check_cost_ceiling()
 
-        # Build error context from previous attempt
+        # Build error context from previous attempt (line-based truncation)
         error_context = ""
         if attempt > 1:
             prev_output = state.log_dir / f"verify-{step.id}-attempt-{attempt - 1}.json"
             if prev_output.exists():
                 prev_data = json.loads(prev_output.read_text())
-                prev_error = prev_data.get("result", "")[:2000]  # Truncate
+                prev_error_lines = prev_data.get("result", "").split("\n")[:50]
+                prev_error = "\n".join(prev_error_lines)
                 error_context = (
                     f"RETRY ATTEMPT {attempt}/{MAX_VERIFY_RETRIES}. "
                     f"Previous error:\n{prev_error}"
                 )
 
+            # Check for stagnation
+            if check_stagnation(state.log_dir, f"verify-{step.id}", attempt):
+                error_context += (
+                    "\nSTAGNATION DETECTED: Previous fix attempts produce the same errors. "
+                    "Try a fundamentally different approach."
+                )
+
         # Implement
+        impl_timeout = get_phase_timeout(_config, f"implement-{step.id}")
         await run_phase(state, PhaseConfig(
             name=f"implement-{step.id}-attempt-{attempt}",
             prompt=(
@@ -357,21 +618,14 @@ async def implement_and_verify(
             model=MODELS["implement"],
             max_turns=40,
             max_budget_usd=8.0,
-            timeout_seconds=600,
+            timeout_seconds=impl_timeout,
         ))
 
-        # Check git progress
-        current_commit = get_git_head()
-        if current_commit == last_commit and last_commit != "none":
-            no_progress_count += 1
-            print(f"  [WARN] No new git commits after {step.id} (count: {no_progress_count})")
-            if no_progress_count >= 3:
-                state.status = "stalled_no_progress"
-                state.save_checkpoint()
-                raise RuntimeError(f"No git progress for 3 consecutive attempts on {step.id}")
-        else:
-            no_progress_count = 0
-            last_commit = current_commit
+        # Check git progress using ProgressTracker
+        if not progress.check(f"implement-{step.id}-attempt-{attempt}"):
+            state.status = "stalled_no_progress"
+            state.save_checkpoint()
+            raise RuntimeError(f"No git progress for {progress.max_no_progress} consecutive attempts on {step.id}")
 
         # Verify (fast mode for early attempts, full suite for final)
         fast_mode = attempt < MAX_VERIFY_RETRIES
@@ -381,6 +635,7 @@ async def implement_and_verify(
             else "Run the FULL test suite (not sampled)"
         )
 
+        verify_timeout = get_phase_timeout(_config, f"verify-{step.id}")
         try:
             verify_result = await run_phase(state, PhaseConfig(
                 name=f"verify-{step.id}-attempt-{attempt}",
@@ -398,7 +653,7 @@ async def implement_and_verify(
                 model=MODELS["verify"],
                 max_turns=15,
                 max_budget_usd=3.0,
-                timeout_seconds=300,
+                timeout_seconds=verify_timeout,
             ))
         except RuntimeError:
             verify_result = PhaseResult(name=f"verify-{step.id}-attempt-{attempt}", verdict="FAIL")
@@ -425,11 +680,55 @@ async def implement_and_verify(
 # --- Main Pipeline ---
 
 async def main():
+    global MODELS, MAX_VERIFY_RETRIES, MAX_INTERROGATION_ITERATIONS
+    global STAGNATION_SIMILARITY_THRESHOLD, _config
+
     ticket = sys.argv[1] if len(sys.argv) > 1 else "NO-TICKET"
+
+    # --- Feature 5: Load config from pipeline.config.sh ---
+    config_path = Path(__file__).parent / "pipeline.config.sh"
+    _config = load_bash_config(config_path)
+
+    # Override hardcoded defaults with config values
+    MODELS = {
+        "phase0": _config.get("MODEL_PHASE0", MODELS["phase0"]),
+        "interrogate": _config.get("MODEL_INTERROGATE", MODELS["interrogate"]),
+        "review": _config.get("MODEL_REVIEW", MODELS["review"]),
+        "generate_docs": _config.get("MODEL_GENERATE_DOCS", MODELS["generate_docs"]),
+        "implement": _config.get("MODEL_IMPLEMENT", MODELS["implement"]),
+        "verify": _config.get("MODEL_VERIFY", MODELS["verify"]),
+        "security": _config.get("MODEL_SECURITY", MODELS["security"]),
+        "holdout": _config.get("MODEL_HOLDOUT", MODELS["holdout"]),
+        "ship": _config.get("MODEL_SHIP", MODELS["ship"]),
+    }
+    MAX_VERIFY_RETRIES = get_config_int(_config, "MAX_VERIFY_RETRIES", 3)
+    MAX_INTERROGATION_ITERATIONS = get_config_int(_config, "MAX_INTERROGATION_ITERATIONS", 2)
+    STAGNATION_SIMILARITY_THRESHOLD = get_config_float(_config, "STAGNATION_SIMILARITY_THRESHOLD", 90) / 100.0
+    max_cost = get_config_float(_config, "MAX_PIPELINE_COST", 50.0)
+
     state = PipelineState(
         ticket=ticket,
-        max_cost=float(os.environ.get("MAX_PIPELINE_COST", "50")),
+        max_cost=max_cost,
     )
+
+    # --- Feature 3: Resume from checkpoint ---
+    if len(sys.argv) > 2 and sys.argv[2] == "--resume" and len(sys.argv) > 3:
+        resume_dir = Path(sys.argv[3])
+        if (resume_dir / "checkpoint.json").exists():
+            checkpoint = json.loads((resume_dir / "checkpoint.json").read_text())
+            state.resume_phase = checkpoint.get("current_phase", "phase0")
+            state.total_cost = checkpoint.get("total_cost", 0.0)
+            state.log_dir = resume_dir
+            print(f"Resuming from checkpoint: phase={state.resume_phase}, cost=${state.total_cost:.2f}")
+        else:
+            print(f"[ERROR] No checkpoint at {resume_dir}/checkpoint.json")
+            sys.exit(1)
+
+    # --- Feature 8: ProgressTracker ---
+    progress = ProgressTracker(max_no_progress=get_config_int(_config, "MAX_NO_PROGRESS", 3))
+
+    # --- Feature 9: ThreadManager ---
+    threads = ThreadManager()
 
     print(f"Starting pipeline for: {ticket}")
     print(f"Max cost: ${state.max_cost:.2f}")
@@ -437,191 +736,235 @@ async def main():
 
     try:
         # ---- Stage 1: Context Scan ----
-        await run_phase(state, PhaseConfig(
-            name="phase0",
-            prompt=(
-                "You are running the Interrogation Protocol pipeline autonomously. "
-                "Read CLAUDE.md first, then execute the phase0 context scan: scan git state, "
-                "check Memory MCP for prior pipeline state, identify project type, TODOs, test status, blockers. "
-                "Write a phase0-summary.md to docs/summaries/. Output must be under 20 lines."
-            ),
-            model=MODELS["phase0"],
-            max_turns=15, max_budget_usd=2.0, timeout_seconds=120,
-        ))
+        if state.should_run_phase("phase0"):
+            _tid = threads.get_or_create("phase0")
+            await run_phase(state, PhaseConfig(
+                name="phase0",
+                prompt=(
+                    "You are running the Interrogation Protocol pipeline autonomously. "
+                    "Read CLAUDE.md first, then execute the phase0 context scan: scan git state, "
+                    "check Memory MCP for prior pipeline state, identify project type, TODOs, test status, blockers. "
+                    "Write a phase0-summary.md to docs/summaries/. Output must be under 20 lines."
+                ),
+                model=MODELS["phase0"],
+                max_turns=15, max_budget_usd=2.0,
+                timeout_seconds=get_phase_timeout(_config, "phase0"),
+            ))
 
         # ---- Stage 2: Interrogation ----
-        await run_phase(state, PhaseConfig(
-            name="interrogate",
-            prompt=(
-                f"Autonomous interrogation for ticket: {ticket}. AUTONOMOUS_MODE=true. "
-                "Read CLAUDE.md, then docs/summaries/phase0-summary.md. "
-                "Execute the full interrogation protocol (all 13 sections). For each section: "
-                "1. Search MCP sources 2. Search codebase 3. Assume with [ASSUMPTION] tags if needed. "
-                "Write transcript to docs/artifacts/ and pyramid summary to docs/summaries/interrogation-summary.md."
-            ),
-            model=MODELS["interrogate"],
-            max_turns=50, max_budget_usd=8.0,
-        ))
+        if state.should_run_phase("interrogate"):
+            _tid = threads.get_or_create("interrogate")
+            await run_phase(state, PhaseConfig(
+                name="interrogate",
+                prompt=(
+                    f"Autonomous interrogation for ticket: {ticket}. AUTONOMOUS_MODE=true. "
+                    "Read CLAUDE.md, then docs/summaries/phase0-summary.md. "
+                    "Execute the full interrogation protocol (all 13 sections). For each section: "
+                    "1. Search MCP sources 2. Search codebase 3. Assume with [ASSUMPTION] tags if needed. "
+                    "Write transcript to docs/artifacts/ and pyramid summary to docs/summaries/interrogation-summary.md."
+                ),
+                model=MODELS["interrogate"],
+                max_turns=50, max_budget_usd=8.0,
+                timeout_seconds=get_phase_timeout(_config, "interrogate"),
+            ))
 
-        # ---- Stage 3: Interrogation Review (LLM-as-Judge) ----
-        review = await run_phase(state, PhaseConfig(
-            name="interrogation-review",
-            prompt=(
+        # ---- Stage 3: Interrogation Review (LLM-as-Judge with Bias Check) ----
+        if state.should_run_phase("interrogation-review"):
+            _tid = threads.get_or_create("interrogation-review")
+            interrogation_review_prompt = (
                 "You are a REVIEWER agent. You did NOT write the interrogation output. "
                 "Read docs/summaries/interrogation-summary.md. Score each section 1-5. "
                 "Calculate overall satisfaction as aggregate decimal. "
                 "Output VERDICT: PASS|ITERATE|NEEDS_HUMAN as the last line."
-            ),
-            model=MODELS["review"],
-            max_turns=20, max_budget_usd=3.0,
-        ))
+            )
+            review_verdict = await run_review_with_bias_check(
+                state, "interrogation-review",
+                prompt_base=interrogation_review_prompt,
+                model=MODELS["review"],
+            )
+            # Create a PhaseResult to use for routing
+            review = PhaseResult(name="interrogation-review", verdict=review_verdict)
 
-        next_phase = route_from_gate("interrogation-review", review.verdict)
-        if next_phase == "BLOCKED":
-            state.status = "needs_human"
-            state.save_checkpoint()
-            print("\nPipeline paused: human input needed for interrogation")
-            sys.exit(2)
-        if next_phase == "interrogate":
-            await run_phase(state, PhaseConfig(
-                name="interrogate-v2",
-                prompt=(
-                    "Re-run interrogation addressing gaps in docs/summaries/interrogation-review.md. "
-                    "Focus on sections that scored below 3. Update summaries."
-                ),
-                model=MODELS["interrogate"],
-                max_turns=50, max_budget_usd=8.0,
-            ))
+            next_phase = route_from_gate("interrogation-review", review.verdict)
+            if next_phase == "BLOCKED":
+                state.status = "needs_human"
+                state.save_checkpoint()
+                print("\nPipeline paused: human input needed for interrogation")
+                sys.exit(2)
+            if next_phase == "interrogate":
+                await run_phase(state, PhaseConfig(
+                    name="interrogate-v2",
+                    prompt=(
+                        "Re-run interrogation addressing gaps in docs/summaries/interrogation-review.md. "
+                        "Focus on sections that scored below 3. Update summaries."
+                    ),
+                    model=MODELS["interrogate"],
+                    max_turns=50, max_budget_usd=8.0,
+                    timeout_seconds=get_phase_timeout(_config, "interrogate"),
+                ))
 
-        # ---- Stage 4: Doc Generation ----
-        await run_phase(state, PhaseConfig(
-            name="generate-docs",
-            prompt=(
-                "Generate all applicable documents from docs/templates/. "
-                "Read docs/summaries/interrogation-summary.md for requirements. "
-                "Write each to docs/[name].md. After all docs: write docs/summaries/documentation-summary.md."
-            ),
-            model=MODELS["generate_docs"],
-            max_turns=50, max_budget_usd=10.0,
-        ))
+        # ---- Stage 4: Doc Generation (with Agent Teams detection) ----
+        if state.should_run_phase("generate-docs"):
+            _tid = threads.get_or_create("generate-docs")
+            if has_agent_teams():
+                await run_phase(state, PhaseConfig(
+                    name="generate-docs-parallel",
+                    prompt=(
+                        "Run /parallel-docs to generate all documentation in parallel using Agent Teams."
+                    ),
+                    model=MODELS["generate_docs"],
+                    max_turns=60, max_budget_usd=15.0,
+                    timeout_seconds=get_phase_timeout(_config, "generate-docs"),
+                ))
+            else:
+                await run_phase(state, PhaseConfig(
+                    name="generate-docs",
+                    prompt=(
+                        "Generate all applicable documents from docs/templates/. "
+                        "Read docs/summaries/interrogation-summary.md for requirements. "
+                        "Write each to docs/[name].md. After all docs: write docs/summaries/documentation-summary.md."
+                    ),
+                    model=MODELS["generate_docs"],
+                    max_turns=50, max_budget_usd=10.0,
+                    timeout_seconds=get_phase_timeout(_config, "generate-docs"),
+                ))
 
-        # ---- Stage 5: Doc Review ----
-        doc_review = await run_phase(state, PhaseConfig(
-            name="doc-review",
-            prompt=(
+        # ---- Stage 5: Doc Review (LLM-as-Judge with Bias Check) ----
+        if state.should_run_phase("doc-review"):
+            _tid = threads.get_or_create("doc-review")
+            doc_review_prompt = (
                 "You are a REVIEWER agent. Review generated docs for completeness. "
                 "Spot-check docs/PRD.md, docs/IMPLEMENTATION_PLAN.md, docs/TESTING_PLAN.md. "
                 "Score satisfaction as aggregate decimal. If >= 80%: VERDICT: PASS. "
                 "If < 80%: VERDICT: ITERATE. Always include VERDICT as the last line."
-            ),
-            model=MODELS["review"],
-            max_turns=20, max_budget_usd=3.0,
-        ))
+            )
+            doc_review_verdict = await run_review_with_bias_check(
+                state, "doc-review",
+                prompt_base=doc_review_prompt,
+                model=MODELS["review"],
+            )
+            doc_review = PhaseResult(name="doc-review", verdict=doc_review_verdict)
 
-        doc_next = route_from_gate("doc-review", doc_review.verdict)
-        if doc_next == "generate-docs":
-            await run_phase(state, PhaseConfig(
-                name="generate-docs-v2",
-                prompt="Re-generate docs addressing gaps from doc review. Focus on flagged sections.",
-                model=MODELS["generate_docs"],
-                max_turns=50, max_budget_usd=10.0,
-            ))
+            doc_next = route_from_gate("doc-review", doc_review.verdict)
+            if doc_next == "generate-docs":
+                await run_phase(state, PhaseConfig(
+                    name="generate-docs-v2",
+                    prompt="Re-generate docs addressing gaps from doc review. Focus on flagged sections.",
+                    model=MODELS["generate_docs"],
+                    max_turns=50, max_budget_usd=10.0,
+                    timeout_seconds=get_phase_timeout(_config, "generate-docs"),
+                ))
 
         # ---- Stage 5b: Holdout Generation ----
         holdouts_dir = Path(".holdouts")
-        existing_holdouts = list(holdouts_dir.glob("holdout-001-*.md")) if holdouts_dir.exists() else []
-        if not existing_holdouts:
-            await run_phase(state, PhaseConfig(
-                name="holdout-generate",
-                prompt=(
-                    "You are the HOLDOUT GENERATOR agent in COMPLETE ISOLATION from implementation. "
-                    "Read docs/PRD.md, docs/APP_FLOW.md, docs/API_SPEC.md, docs/DATA_MODELS.md. "
-                    "Generate 8-12 adversarial test scenarios. Write each to .holdouts/holdout-NNN-[slug].md."
-                ),
-                model=MODELS["holdout"],
-                max_turns=25, max_budget_usd=5.0,
-            ))
+        if state.should_run_phase("holdout-generate"):
+            existing_holdouts = list(holdouts_dir.glob("holdout-001-*.md")) if holdouts_dir.exists() else []
+            if not existing_holdouts:
+                _tid = threads.get_or_create("holdout-generate")
+                await run_phase(state, PhaseConfig(
+                    name="holdout-generate",
+                    prompt=(
+                        "You are the HOLDOUT GENERATOR agent in COMPLETE ISOLATION from implementation. "
+                        "Read docs/PRD.md, docs/APP_FLOW.md, docs/API_SPEC.md, docs/DATA_MODELS.md. "
+                        "Generate 8-12 adversarial test scenarios. Write each to .holdouts/holdout-NNN-[slug].md."
+                    ),
+                    model=MODELS["holdout"],
+                    max_turns=25, max_budget_usd=5.0,
+                    timeout_seconds=get_phase_timeout(_config, "holdout-generate"),
+                ))
 
         # ---- Stage 6: Implementation Loop ----
-        steps = await extract_impl_steps(state, ticket)
-        print(f"\nImplementation plan has {len(steps)} steps")
+        if state.should_run_phase("implement"):
+            steps = await extract_impl_steps(state, ticket)
+            print(f"\nImplementation plan has {len(steps)} steps")
 
-        for step in steps:
-            print(f"\n--- Implementing: {step.id} - {step.title} ---")
-            verified = await implement_and_verify(state, step, ticket)
-            if not verified:
-                print(f"\n[ERROR] Step {step.id} blocked after {MAX_VERIFY_RETRIES} attempts")
-                sys.exit(3)
+            for step in steps:
+                _tid = threads.get_or_create(f"implement-{step.id}")
+                print(f"\n--- Implementing: {step.id} - {step.title} ---")
+                verified = await implement_and_verify(state, step, ticket, progress=progress)
+                if not verified:
+                    print(f"\n[ERROR] Step {step.id} blocked after {MAX_VERIFY_RETRIES} attempts")
+                    sys.exit(3)
 
         # ---- Stage 7: Holdout Validation ----
-        holdout_files = list(holdouts_dir.glob("holdout-*.md")) if holdouts_dir.exists() else []
-        if holdout_files:
-            holdout_result = await run_phase(state, PhaseConfig(
-                name="holdout-validate",
-                prompt=(
-                    "You are a HOLDOUT VALIDATION agent. Test the implementation against hidden scenarios. "
-                    "Read each file in .holdouts/holdout-*.md. For each scenario: check preconditions, "
-                    "walk through steps against actual code, evaluate acceptance criteria. "
-                    "Score: (satisfied / total) as percentage. "
-                    "If >= 80% and 0 anti-pattern flags: VERDICT: PASS. "
-                    "If < 80%: VERDICT: FAIL. Always include VERDICT as last line."
-                ),
-                model=MODELS["holdout"],
-                max_turns=25, max_budget_usd=5.0,
-            ))
+        if state.should_run_phase("holdout-validate"):
+            holdout_files = list(holdouts_dir.glob("holdout-*.md")) if holdouts_dir.exists() else []
+            if holdout_files:
+                _tid = threads.get_or_create("holdout-validate")
+                holdout_result = await run_phase(state, PhaseConfig(
+                    name="holdout-validate",
+                    prompt=(
+                        "You are a HOLDOUT VALIDATION agent. Test the implementation against hidden scenarios. "
+                        "Read each file in .holdouts/holdout-*.md. For each scenario: check preconditions, "
+                        "walk through steps against actual code, evaluate acceptance criteria. "
+                        "Score: (satisfied / total) as percentage. "
+                        "If >= 80% and 0 anti-pattern flags: VERDICT: PASS. "
+                        "If < 80%: VERDICT: FAIL. Always include VERDICT as last line."
+                    ),
+                    model=MODELS["holdout"],
+                    max_turns=25, max_budget_usd=5.0,
+                    timeout_seconds=get_phase_timeout(_config, "holdout-validate"),
+                ))
 
-            holdout_next = route_from_gate("holdout-validate", holdout_result.verdict)
-            if holdout_next == "implement":
-                state.status = "holdout_failed"
-                state.save_checkpoint()
-                print("\n[ERROR] Holdout validation failed")
-                sys.exit(4)
+                holdout_next = route_from_gate("holdout-validate", holdout_result.verdict)
+                if holdout_next == "implement":
+                    state.status = "holdout_failed"
+                    state.save_checkpoint()
+                    print("\n[ERROR] Holdout validation failed")
+                    sys.exit(4)
 
         # ---- Stage 8: Security Audit ----
-        security_result = await run_phase(state, PhaseConfig(
-            name="security-audit",
-            prompt=(
-                "You are a SECURITY AUDITOR. Scan all source files for: "
-                "hardcoded secrets, SQL/XSS/command injection, missing auth checks, "
-                "insecure defaults, missing input validation, sensitive data in logs. "
-                "Severity: BLOCKER | WARNING | INFO. "
-                "If 0 BLOCKERs: VERDICT: PASS. If any BLOCKERs: VERDICT: FAIL. "
-                "Always include VERDICT as last line."
-            ),
-            model=MODELS["security"],
-            max_turns=20, max_budget_usd=3.0,
-        ))
-
-        security_next = route_from_gate("security-audit", security_result.verdict)
-        if security_next == "implement":
-            print("  [WARN] Security blockers found. Attempting auto-fix.")
-            await run_phase(state, PhaseConfig(
-                name="security-fix",
+        if state.should_run_phase("security-audit"):
+            _tid = threads.get_or_create("security-audit")
+            security_result = await run_phase(state, PhaseConfig(
+                name="security-audit",
                 prompt=(
-                    f"Read {state.log_dir}/security-audit.json. Fix all BLOCKER-severity issues. "
-                    "Do not change functionality. Commit with message 'fix(security): address audit findings'"
+                    "You are a SECURITY AUDITOR. Scan all source files for: "
+                    "hardcoded secrets, SQL/XSS/command injection, missing auth checks, "
+                    "insecure defaults, missing input validation, sensitive data in logs. "
+                    "Severity: BLOCKER | WARNING | INFO. "
+                    "If 0 BLOCKERs: VERDICT: PASS. If any BLOCKERs: VERDICT: FAIL. "
+                    "Always include VERDICT as last line."
                 ),
-                model=MODELS["implement"],
-                max_turns=40, max_budget_usd=8.0,
+                model=MODELS["security"],
+                max_turns=20, max_budget_usd=3.0,
+                timeout_seconds=get_phase_timeout(_config, "security-audit"),
             ))
 
+            security_next = route_from_gate("security-audit", security_result.verdict)
+            if security_next == "implement":
+                print("  [WARN] Security blockers found. Attempting auto-fix.")
+                await run_phase(state, PhaseConfig(
+                    name="security-fix",
+                    prompt=(
+                        f"Read {state.log_dir}/security-audit.json. Fix all BLOCKER-severity issues. "
+                        "Do not change functionality. Commit with message 'fix(security): address audit findings'"
+                    ),
+                    model=MODELS["implement"],
+                    max_turns=40, max_budget_usd=8.0,
+                    timeout_seconds=get_phase_timeout(_config, "implement"),
+                ))
+
         # ---- Stage 9: Ship ----
-        await run_phase(state, PhaseConfig(
-            name="ship",
-            prompt=(
-                f"You are running the final SHIP phase.\n\n"
-                f"Pre-flight checks:\n"
-                f"1. Run full test suite one final time\n"
-                f"2. Verify all implementation steps are committed\n"
-                f"3. Verify no uncommitted changes\n\n"
-                f"If all pass, create a PR:\n"
-                f"- Title: '{ticket}: [generated title from PRD]'\n"
-                f"- Body: built from docs/summaries/ (executive sections only)\n"
-                f"Push branch and create PR via gh CLI. Output the PR URL as the last line."
-            ),
-            model=MODELS["ship"],
-            max_turns=20, max_budget_usd=5.0,
-        ))
+        if state.should_run_phase("ship"):
+            _tid = threads.get_or_create("ship")
+            await run_phase(state, PhaseConfig(
+                name="ship",
+                prompt=(
+                    f"You are running the final SHIP phase.\n\n"
+                    f"Pre-flight checks:\n"
+                    f"1. Run full test suite one final time\n"
+                    f"2. Verify all implementation steps are committed\n"
+                    f"3. Verify no uncommitted changes\n\n"
+                    f"If all pass, create a PR:\n"
+                    f"- Title: '{ticket}: [generated title from PRD]'\n"
+                    f"- Body: built from docs/summaries/ (executive sections only)\n"
+                    f"Push branch and create PR via gh CLI. Output the PR URL as the last line."
+                ),
+                model=MODELS["ship"],
+                max_turns=20, max_budget_usd=5.0,
+                timeout_seconds=get_phase_timeout(_config, "ship"),
+            ))
 
         state.status = "completed"
 
