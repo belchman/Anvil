@@ -1,5 +1,7 @@
 # Interrogation Protocol v3.0
 
+**Read CONTRIBUTING_AGENT.md for The Way.** It governs all work in this repository.
+
 ## Quick Reference
 - Autonomous: `./run-pipeline.sh TICKET-ID`
 - Interactive: `claude` then `/phase0` -> follow prompts
@@ -10,6 +12,7 @@
 ## Session Start
 1. Run `/phase0` (mandatory, no exceptions)
 2. Do not write code until docs are approved
+3. Do not implement until executable specifications exist and fail
 
 ## Context Discipline
 - Each phase starts a FRESH session (never --continue across phases)
@@ -26,6 +29,9 @@
 
 ## Absolute Rules
 - Never write code until documentation is approved
+- Never implement until executable specifications exist and fail (red phase)
+- Write only the code required to make specs pass (green phase)
+- Refactor only while all specs remain green
 - Never skip verification after implementation steps
 - Never proceed past a blocker without surfacing it
 - Every error: root cause + prevention rule + lessons update
