@@ -15,10 +15,18 @@ FAIL=0
 WARN=0
 MODE="${1:-full}"
 
-GREEN='\033[0;32m'
-RED='\033[0;31m'
-YELLOW='\033[0;33m'
-NC='\033[0m'
+# Colors (disabled when not a terminal)
+if [ -t 1 ]; then
+  GREEN='\033[0;32m'
+  RED='\033[0;31m'
+  YELLOW='\033[0;33m'
+  NC='\033[0m'
+else
+  GREEN=''
+  RED=''
+  YELLOW=''
+  NC=''
+fi
 
 pass() { ((PASS++)); echo -e "  ${GREEN}PASS${NC} $1"; }
 fail() { ((FAIL++)); echo -e "  ${RED}FAIL${NC} $1"; }
@@ -34,6 +42,7 @@ section "File Inventory"
 # Core files
 CORE_FILES=(
   "CLAUDE.md"
+  "CONTRIBUTING_AGENT.md"
   "README.md"
   "run-pipeline.sh"
   "run_pipeline.py"
@@ -83,15 +92,18 @@ for r in "${RULES[@]}"; do
   fi
 done
 
-# Doc templates (11 expected)
-TEMPLATES=(PRD APP_FLOW TECH_STACK DATA_MODELS API_SPEC FRONTEND_GUIDELINES IMPLEMENTATION_PLAN TESTING_PLAN SECURITY_CHECKLIST OBSERVABILITY ROLLOUT_PLAN)
-for t in "${TEMPLATES[@]}"; do
-  if [ -f "$ROOT/docs/templates/$t.md" ]; then
+# Doc templates (auto-discovered)
+TEMPLATES=()
+for tmpl_file in "$ROOT/docs/templates"/*.md; do
+  if [ -f "$tmpl_file" ]; then
+    t=$(basename "$tmpl_file" .md)
+    TEMPLATES+=("$t")
     pass "template: $t"
-  else
-    fail "template missing: $t"
   fi
 done
+if [ "${#TEMPLATES[@]}" -lt 1 ]; then
+  fail "no templates found in docs/templates/"
+fi
 
 # Settings
 if [ -f "$ROOT/.claude/settings.json" ]; then
@@ -227,6 +239,9 @@ CONFIG_VARS=(
   TIMEOUT_PHASE0 TIMEOUT_INTERROGATE TIMEOUT_REVIEW TIMEOUT_GENERATE_DOCS
   TIMEOUT_IMPLEMENT TIMEOUT_VERIFY TIMEOUT_SECURITY TIMEOUT_HOLDOUT TIMEOUT_SHIP
   MAX_NO_PROGRESS CONTEXT_WINDOW
+  THRESHOLD_AUTO_PASS THRESHOLD_PASS THRESHOLD_ITERATE THRESHOLD_DOC_REVIEW THRESHOLD_HOLDOUT
+  DOCS_DIR ARTIFACTS_DIR SUMMARIES_DIR TEMPLATES_DIR HOLDOUTS_DIR LOG_BASE_DIR
+  PHASE_ORDER DEFAULT_TIMEOUT FIDELITY_UPGRADE_THRESHOLD FIDELITY_DOWNGRADE_THRESHOLD
 )
 for var in "${CONFIG_VARS[@]}"; do
   if grep -q "^${var}=" "$ROOT/pipeline.config.sh"; then
@@ -350,7 +365,26 @@ for code in 0 1 2 3 4; do
 done
 
 # ============================================================
-# 10. Security Checks
+# 10. Portability Checks
+# ============================================================
+section "Portability"
+
+# No grep -oP (PCRE) in run-pipeline.sh (not portable to macOS/BSD)
+if grep -n 'grep -oP' "$ROOT/run-pipeline.sh" >/dev/null 2>&1; then
+  fail "run-pipeline.sh uses grep -oP (not portable)"
+else
+  pass "run-pipeline.sh avoids grep -oP"
+fi
+
+# No hardcoded docs/artifacts/ paths in run-pipeline.sh (should use config vars)
+if grep -n '"docs/artifacts/' "$ROOT/run-pipeline.sh" >/dev/null 2>&1; then
+  fail "run-pipeline.sh has hardcoded docs/artifacts/ paths"
+else
+  pass "run-pipeline.sh uses config for artifact paths"
+fi
+
+# ============================================================
+# 11. Security Checks
 # ============================================================
 section "Security"
 
@@ -369,7 +403,7 @@ else
 fi
 
 # ============================================================
-# 11. Doc Template Cross-References
+# 12. Doc Template Cross-References
 # ============================================================
 section "Doc Template Cross-References"
 

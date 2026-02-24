@@ -21,13 +21,13 @@ digraph pipeline {
   interrogate -> interrogation_review [label="always"]
 
   // Interrogation review routing
-  interrogation_review -> generate_docs [label="PASS (satisfaction >= 0.7)"]
-  interrogation_review -> interrogate [label="ITERATE (satisfaction 0.5-0.69)" style=dashed]
+  interrogation_review -> generate_docs [label="PASS (>= THRESHOLD_PASS)"]
+  interrogation_review -> interrogate [label="ITERATE (below THRESHOLD_PASS)" style=dashed]
   interrogation_review -> BLOCKED [label="NEEDS_HUMAN (critical unknowns)" color=red]
 
   // Doc generation routing
   generate_docs -> doc_review [label="always"]
-  doc_review -> holdout_generate [label="PASS (satisfaction >= 0.8)"]
+  doc_review -> holdout_generate [label="PASS (>= THRESHOLD_DOC_REVIEW)"]
   doc_review -> generate_docs [label="ITERATE" style=dashed]
 
   holdout_generate -> implement [label="always"]
@@ -36,12 +36,12 @@ digraph pipeline {
   implement -> verify [label="always"]
   verify -> implement [label="PASS + more steps"]
   verify -> holdout_validate [label="PASS + all done"]
-  verify -> implement [label="FAIL (retries < 3)" style=dashed color=orange]
-  verify -> interrogate [label="FAIL (retries >= 3, spec issue)" style=dashed color=red]
-  verify -> BLOCKED [label="FAIL (retries >= 3, code issue)" color=red]
+  verify -> implement [label="FAIL (< MAX_VERIFY_RETRIES)" style=dashed color=orange]
+  verify -> interrogate [label="FAIL (>= MAX_VERIFY_RETRIES, spec issue)" style=dashed color=red]
+  verify -> BLOCKED [label="FAIL (>= MAX_VERIFY_RETRIES, code issue)" color=red]
 
   // Ship path
-  holdout_validate -> security_audit [label="PASS (>= 0.8)"]
+  holdout_validate -> security_audit [label="PASS (>= THRESHOLD_HOLDOUT)"]
   holdout_validate -> implement [label="FAIL" style=dashed color=orange]
   security_audit -> ship [label="no blockers"]
   security_audit -> implement [label="blockers found" style=dashed]

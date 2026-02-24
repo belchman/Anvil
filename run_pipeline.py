@@ -32,6 +32,7 @@ from claude_agent_sdk import (
 
 # --- Configuration ---
 
+# Fallback defaults — overridden by pipeline.config.sh in main()
 MODELS = {
     "phase0": "claude-sonnet-4-5-20250929",
     "interrogate": "claude-opus-4-6",
@@ -44,6 +45,7 @@ MODELS = {
     "ship": "claude-sonnet-4-5-20250929",
 }
 
+# Fallback defaults — overridden by pipeline.config.sh in main()
 MAX_VERIFY_RETRIES = 3
 MAX_INTERROGATION_ITERATIONS = 2
 STAGNATION_SIMILARITY_THRESHOLD = 0.90
@@ -51,7 +53,7 @@ STAGNATION_SIMILARITY_THRESHOLD = 0.90
 # Module-level config dict, populated from pipeline.config.sh in main()
 _config: dict[str, str] = {}
 
-# Phase ordering for resume support
+# Fallback defaults — overridden by pipeline.config.sh in main()
 PHASE_ORDER = [
     "phase0", "interrogate", "interrogation-review", "generate-docs",
     "doc-review", "holdout-generate", "implement", "holdout-validate",
@@ -112,9 +114,12 @@ def select_fidelity(default_mode: str, estimated_tokens: int = 0, window_size: i
         "summary:medium": "summary:low",
     }
 
-    if utilization > 60:
+    downgrade_threshold = get_config_int(_config, "FIDELITY_DOWNGRADE_THRESHOLD", 60)
+    upgrade_threshold = get_config_int(_config, "FIDELITY_UPGRADE_THRESHOLD", 30)
+
+    if utilization > downgrade_threshold:
         return DOWNGRADE.get(default_mode, "compact")
-    elif utilization < 30:
+    elif utilization < upgrade_threshold:
         return UPGRADE.get(default_mode, default_mode)
     return default_mode
 
@@ -141,7 +146,8 @@ def get_phase_timeout(config: dict[str, str], phase_name: str) -> int:
     base = re.sub(r'-step-[\da-z-]+$', '', base)
     base = re.sub(r'-pass\d+$', '', base)
     upper = base.upper().replace("-", "_")
-    return get_config_int(config, f"TIMEOUT_{upper}", 600)
+    default_timeout = get_config_int(config, "DEFAULT_TIMEOUT", 600)
+    return get_config_int(config, f"TIMEOUT_{upper}", default_timeout)
 
 
 # --- Data Types ---
@@ -228,8 +234,8 @@ class PipelineState:
     max_cost: float = 50.0
     resume_phase: str = ""
     phases: list[PhaseResult] = field(default_factory=list)
-    log_dir: Path = field(default_factory=lambda: Path("docs/artifacts/pipeline-runs") / datetime.now().strftime("%Y-%m-%d-%H%M"))
-    kill_switch: Path = Path(".pipeline-kill")
+    log_dir: Path = field(default_factory=lambda: Path(_config.get("LOG_BASE_DIR", "docs/artifacts/pipeline-runs")) / datetime.now().strftime("%Y-%m-%d-%H%M"))
+    kill_switch: Path = field(default_factory=lambda: Path(_config.get("KILL_SWITCH_FILE", ".pipeline-kill")))
 
     def check_kill_switch(self):
         if self.kill_switch.exists():
@@ -318,12 +324,15 @@ def parse_satisfaction(result_text: str) -> float:
 
 
 def score_to_verdict(score: float) -> str:
-    """Convert satisfaction score to verdict."""
-    if score >= 0.9:
+    """Convert satisfaction score to verdict using config thresholds."""
+    t_auto = get_config_int(_config, "THRESHOLD_AUTO_PASS", 90) / 100.0
+    t_pass = get_config_int(_config, "THRESHOLD_PASS", 70) / 100.0
+    t_iterate = get_config_int(_config, "THRESHOLD_ITERATE", 50) / 100.0
+    if score >= t_auto:
         return "AUTO_PASS"
-    elif score >= 0.7:
+    elif score >= t_pass:
         return "PASS_WITH_NOTES"
-    elif score >= 0.5:
+    elif score >= t_iterate:
         return "ITERATE"
     return "BLOCK"
 
@@ -607,11 +616,14 @@ async def implement_and_verify(
             name=f"implement-{step.id}-attempt-{attempt}",
             prompt=(
                 f"You are implementing step {step.id}: {step.title}\n\n"
-                f"Read CLAUDE.md for rules. Read docs/summaries/documentation-summary.md for context.\n"
+                f"Read CLAUDE.md for rules. Read {_config.get('SUMMARIES_DIR', 'docs/summaries')}/documentation-summary.md for context.\n"
                 f"Read the specific doc sections relevant to this step.\n\n"
                 f"Description: {step.description}\n\n"
                 f"{error_context}\n\n"
-                f"Implement this step. Follow existing codebase patterns. Type everything. Handle all errors.\n"
+                f"Follow The Way (CONTRIBUTING_AGENT.md):\n"
+                f"1. RED: Write executable specifications (tests) for this step's behavior FIRST. Run them and confirm they fail.\n"
+                f"2. GREEN: Write only the code required to make the specs pass. Follow existing codebase patterns. Type everything. Handle all errors.\n"
+                f"3. REFACTOR: Clean up only while all specs remain green.\n"
                 f"After implementation, run the project's type checker and linter to verify your changes compile.\n"
                 f"Commit your changes with message: 'feat({step.id}): {step.title}'"
             ),
@@ -681,7 +693,7 @@ async def implement_and_verify(
 
 async def main():
     global MODELS, MAX_VERIFY_RETRIES, MAX_INTERROGATION_ITERATIONS
-    global STAGNATION_SIMILARITY_THRESHOLD, _config
+    global STAGNATION_SIMILARITY_THRESHOLD, PHASE_ORDER, _config
 
     ticket = sys.argv[1] if len(sys.argv) > 1 else "NO-TICKET"
 
@@ -704,6 +716,9 @@ async def main():
     MAX_VERIFY_RETRIES = get_config_int(_config, "MAX_VERIFY_RETRIES", 3)
     MAX_INTERROGATION_ITERATIONS = get_config_int(_config, "MAX_INTERROGATION_ITERATIONS", 2)
     STAGNATION_SIMILARITY_THRESHOLD = get_config_float(_config, "STAGNATION_SIMILARITY_THRESHOLD", 90) / 100.0
+    phase_order_str = _config.get("PHASE_ORDER", "")
+    if phase_order_str:
+        PHASE_ORDER = phase_order_str.split()
     max_cost = get_config_float(_config, "MAX_PIPELINE_COST", 50.0)
 
     state = PipelineState(
@@ -744,7 +759,7 @@ async def main():
                     "You are running the Interrogation Protocol pipeline autonomously. "
                     "Read CLAUDE.md first, then execute the phase0 context scan: scan git state, "
                     "check Memory MCP for prior pipeline state, identify project type, TODOs, test status, blockers. "
-                    "Write a phase0-summary.md to docs/summaries/. Output must be under 20 lines."
+                    f"Write a phase0-summary.md to {_config.get('SUMMARIES_DIR', 'docs/summaries')}/. Output must be under 20 lines."
                 ),
                 model=MODELS["phase0"],
                 max_turns=15, max_budget_usd=2.0,
@@ -758,10 +773,10 @@ async def main():
                 name="interrogate",
                 prompt=(
                     f"Autonomous interrogation for ticket: {ticket}. AUTONOMOUS_MODE=true. "
-                    "Read CLAUDE.md, then docs/summaries/phase0-summary.md. "
+                    f"Read CLAUDE.md, then {_config.get('SUMMARIES_DIR', 'docs/summaries')}/phase0-summary.md. "
                     "Execute the full interrogation protocol (all 13 sections). For each section: "
                     "1. Search MCP sources 2. Search codebase 3. Assume with [ASSUMPTION] tags if needed. "
-                    "Write transcript to docs/artifacts/ and pyramid summary to docs/summaries/interrogation-summary.md."
+                    f"Write transcript to {_config.get('ARTIFACTS_DIR', 'docs/artifacts')}/ and pyramid summary to {_config.get('SUMMARIES_DIR', 'docs/summaries')}/interrogation-summary.md."
                 ),
                 model=MODELS["interrogate"],
                 max_turns=50, max_budget_usd=8.0,
@@ -773,7 +788,7 @@ async def main():
             _tid = threads.get_or_create("interrogation-review")
             interrogation_review_prompt = (
                 "You are a REVIEWER agent. You did NOT write the interrogation output. "
-                "Read docs/summaries/interrogation-summary.md. Score each section 1-5. "
+                f"Read {_config.get('SUMMARIES_DIR', 'docs/summaries')}/interrogation-summary.md. Score each section 1-5. "
                 "Calculate overall satisfaction as aggregate decimal. "
                 "Output VERDICT: PASS|ITERATE|NEEDS_HUMAN as the last line."
             )
@@ -795,7 +810,7 @@ async def main():
                 await run_phase(state, PhaseConfig(
                     name="interrogate-v2",
                     prompt=(
-                        "Re-run interrogation addressing gaps in docs/summaries/interrogation-review.md. "
+                        f"Re-run interrogation addressing gaps in {_config.get('SUMMARIES_DIR', 'docs/summaries')}/interrogation-review.md. "
                         "Focus on sections that scored below 3. Update summaries."
                     ),
                     model=MODELS["interrogate"],
@@ -820,9 +835,12 @@ async def main():
                 await run_phase(state, PhaseConfig(
                     name="generate-docs",
                     prompt=(
-                        "Generate all applicable documents from docs/templates/. "
-                        "Read docs/summaries/interrogation-summary.md for requirements. "
-                        "Write each to docs/[name].md. After all docs: write docs/summaries/documentation-summary.md."
+                        f"Read CLAUDE.md and CONTRIBUTING_AGENT.md (The Way). "
+                        f"Generate all applicable documents from {_config.get('TEMPLATES_DIR', 'docs/templates')}/. "
+                        f"Read {_config.get('SUMMARIES_DIR', 'docs/summaries')}/interrogation-summary.md for requirements. "
+                        f"BDD REQUIREMENT: Every feature in PRD.md MUST include acceptance criteria in Given/When/Then (Gherkin) format. "
+                        f"TESTING_PLAN.md MUST include executable specifications derived from these acceptance criteria. "
+                        f"Write each to {_config.get('DOCS_DIR', 'docs')}/[name].md. After all docs: write {_config.get('SUMMARIES_DIR', 'docs/summaries')}/documentation-summary.md."
                     ),
                     model=MODELS["generate_docs"],
                     max_turns=50, max_budget_usd=10.0,
@@ -856,7 +874,7 @@ async def main():
                 ))
 
         # ---- Stage 5b: Holdout Generation ----
-        holdouts_dir = Path(".holdouts")
+        holdouts_dir = Path(_config.get("HOLDOUTS_DIR", ".holdouts"))
         if state.should_run_phase("holdout-generate"):
             existing_holdouts = list(holdouts_dir.glob("holdout-001-*.md")) if holdouts_dir.exists() else []
             if not existing_holdouts:
@@ -866,7 +884,7 @@ async def main():
                     prompt=(
                         "You are the HOLDOUT GENERATOR agent in COMPLETE ISOLATION from implementation. "
                         "Read docs/PRD.md, docs/APP_FLOW.md, docs/API_SPEC.md, docs/DATA_MODELS.md. "
-                        "Generate 8-12 adversarial test scenarios. Write each to .holdouts/holdout-NNN-[slug].md."
+                        f"Generate 8-12 adversarial test scenarios. Write each to {_config.get('HOLDOUTS_DIR', '.holdouts')}/holdout-NNN-[slug].md."
                     ),
                     model=MODELS["holdout"],
                     max_turns=25, max_budget_usd=5.0,
@@ -895,7 +913,7 @@ async def main():
                     name="holdout-validate",
                     prompt=(
                         "You are a HOLDOUT VALIDATION agent. Test the implementation against hidden scenarios. "
-                        "Read each file in .holdouts/holdout-*.md. For each scenario: check preconditions, "
+                        f"Read each file in {_config.get('HOLDOUTS_DIR', '.holdouts')}/holdout-*.md. For each scenario: check preconditions, "
                         "walk through steps against actual code, evaluate acceptance criteria. "
                         "Score: (satisfied / total) as percentage. "
                         "If >= 80% and 0 anti-pattern flags: VERDICT: PASS. "
@@ -958,7 +976,7 @@ async def main():
                     f"3. Verify no uncommitted changes\n\n"
                     f"If all pass, create a PR:\n"
                     f"- Title: '{ticket}: [generated title from PRD]'\n"
-                    f"- Body: built from docs/summaries/ (executive sections only)\n"
+                    f"- Body: built from {_config.get('SUMMARIES_DIR', 'docs/summaries')}/ (executive sections only)\n"
                     f"Push branch and create PR via gh CLI. Output the PR URL as the last line."
                 ),
                 model=MODELS["ship"],

@@ -8,6 +8,18 @@ on:
       ticket:
         description: 'Ticket ID or feature description'
         required: true
+      node_version:
+        description: 'Node.js version to use'
+        required: false
+        default: '20'
+      trigger_label:
+        description: 'Issue label that triggers the pipeline'
+        required: false
+        default: 'agent-ready'
+
+env:
+  TRIGGER_LABEL: agent-ready
+  DEFAULT_NODE_VERSION: '20'
 
 permissions:
   contents: write
@@ -16,7 +28,7 @@ permissions:
 
 jobs:
   run-pipeline:
-    if: github.event.label.name == 'agent-ready' || github.event_name == 'workflow_dispatch'
+    if: github.event.label.name == inputs.trigger_label || github.event.label.name == env.TRIGGER_LABEL || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 120
 
@@ -26,7 +38,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: ${{ inputs.node_version || env.DEFAULT_NODE_VERSION }}
 
       - name: Install Claude Code
         run: npm install -g @anthropic-ai/claude-code
@@ -39,6 +51,13 @@ jobs:
           else
             echo "ticket=${{ github.event.issue.number }}" >> $GITHUB_OUTPUT
           fi
+
+      - name: Load pipeline config
+        id: config
+        run: |
+          # Extract LOG_BASE_DIR from pipeline.config.sh
+          LOG_BASE_DIR=$(grep '^LOG_BASE_DIR=' pipeline.config.sh | cut -d'"' -f2)
+          echo "log_base_dir=${LOG_BASE_DIR:-docs/artifacts/pipeline-runs}" >> $GITHUB_OUTPUT
 
       - name: Run pipeline
         env:
@@ -55,4 +74,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: pipeline-logs
-          path: docs/artifacts/pipeline-runs/
+          path: ${{ steps.config.outputs.log_base_dir }}/

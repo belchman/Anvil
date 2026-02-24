@@ -65,9 +65,36 @@ MAX_NO_PROGRESS=3  # consecutive impl phases without git commits -> stall
 # Context window target (tokens)
 CONTEXT_WINDOW=200000
 
+# Satisfaction thresholds (0-100 scale, converted to decimal in runners)
+THRESHOLD_AUTO_PASS=90
+THRESHOLD_PASS=70
+THRESHOLD_ITERATE=50
+THRESHOLD_DOC_REVIEW=80
+THRESHOLD_HOLDOUT=80
+
+# Directory paths (relative to project root)
+DOCS_DIR="docs"
+ARTIFACTS_DIR="docs/artifacts"
+SUMMARIES_DIR="docs/summaries"
+TEMPLATES_DIR="docs/templates"
+HOLDOUTS_DIR=".holdouts"
+LOG_BASE_DIR="docs/artifacts/pipeline-runs"
+
+# Phase execution order (space-separated)
+PHASE_ORDER="phase0 interrogate interrogation-review generate-docs doc-review holdout-generate implement holdout-validate security-audit ship"
+
+# Default phase timeout (seconds) when no phase-specific timeout exists
+DEFAULT_TIMEOUT=600
+
+# Context fidelity auto-adjustment thresholds (percent of window)
+FIDELITY_UPGRADE_THRESHOLD=30
+FIDELITY_DOWNGRADE_THRESHOLD=60
+
 # Guard: ensure no timeout is zero (would cause immediate timeout)
 for _t_var in TIMEOUT_PHASE0 TIMEOUT_INTERROGATE TIMEOUT_REVIEW TIMEOUT_GENERATE_DOCS \
-  TIMEOUT_IMPLEMENT TIMEOUT_VERIFY TIMEOUT_SECURITY TIMEOUT_HOLDOUT TIMEOUT_SHIP; do
+  TIMEOUT_IMPLEMENT TIMEOUT_VERIFY TIMEOUT_SECURITY TIMEOUT_HOLDOUT TIMEOUT_SHIP \
+  THRESHOLD_AUTO_PASS THRESHOLD_PASS THRESHOLD_ITERATE THRESHOLD_DOC_REVIEW THRESHOLD_HOLDOUT \
+  DEFAULT_TIMEOUT FIDELITY_UPGRADE_THRESHOLD FIDELITY_DOWNGRADE_THRESHOLD; do
   if [ "${!_t_var}" -eq 0 ] 2>/dev/null; then
     echo "[WARN] ${_t_var}=0 would cause immediate timeout, setting to 60"
     eval "${_t_var}=60"

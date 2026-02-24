@@ -6,7 +6,7 @@ set -euo pipefail
 #
 # Usage:
 #   ./run-pipeline.sh "TICKET-ID or feature description"
-#   ./run-pipeline.sh "TICKET-ID" --resume docs/artifacts/pipeline-runs/2026-02-23-1430
+#   ./run-pipeline.sh "TICKET-ID" --resume ${ARTIFACTS_DIR}/pipeline-runs/2026-02-23-1430
 #
 # Exit codes:
 #   0 = Pipeline complete, PR created
@@ -75,6 +75,10 @@ validate_numeric() {
   fi
 }
 
+extract_verdict() {
+  sed -n 's/.*VERDICT: \([A-Z_]*\).*/\1/p' | tail -1
+}
+
 # ---- Arguments ----
 if [ -z "${1:-}" ]; then
   echo "Usage: ./run-pipeline.sh TICKET-ID [--resume LOG_DIR]" >&2
@@ -82,7 +86,7 @@ if [ -z "${1:-}" ]; then
 fi
 TICKET="$1"
 DATE=$(date +%Y-%m-%d-%H%M)
-LOG_DIR="docs/artifacts/pipeline-runs/${DATE}"
+LOG_DIR="${LOG_BASE_DIR}/${DATE}"
 CHECKPOINT_FILE="${LOG_DIR}/checkpoint.json"
 COST_LOG="${LOG_DIR}/costs.json"
 TOTAL_COST=0
@@ -111,11 +115,18 @@ if [ -z "$RESUME_FROM" ]; then
   echo '{"phases":[],"total_cost":0,"status":"running","started":"'"$(date -Iseconds)"'"}' > "$COST_LOG"
 fi
 
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m'
+# Colors for output (disabled when not a terminal)
+if [ -t 1 ]; then
+  RED='\033[0;31m'
+  GREEN='\033[0;32m'
+  YELLOW='\033[1;33m'
+  NC='\033[0m'
+else
+  RED=''
+  GREEN=''
+  YELLOW=''
+  NC=''
+fi
 
 log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$1"; }
 log_phase() { printf '\n%s========== %s ==========%s\n\n' "$GREEN" "$1" "$NC"; }
@@ -186,7 +197,7 @@ EOF
 # ---- Resume Helper (Step 6b) ----
 # Check if a phase should be skipped when resuming a previous run
 
-PHASE_ORDER=(phase0 interrogate interrogation-review generate-docs doc-review holdout-generate implement holdout-validate security-audit ship)
+IFS=' ' read -ra PHASE_ORDER <<< "${PHASE_ORDER}"
 
 should_run_phase() {
   local phase="$1"
@@ -244,7 +255,7 @@ select_fidelity() {
   utilization=$(echo "($estimated_tokens * 100) / $window_size" | bc -l 2>/dev/null | cut -d. -f1)
   utilization=$(validate_numeric "$utilization" "50")
 
-  if [ "$utilization" -gt 60 ]; then
+  if [ "$utilization" -gt "$FIDELITY_DOWNGRADE_THRESHOLD" ]; then
     # Downgrade fidelity (less context)
     case "$default_mode" in
       "full") echo "truncate" ;;
@@ -254,7 +265,7 @@ select_fidelity() {
       "summary:high") echo "compact" ;;
       *) echo "compact" ;;
     esac
-  elif [ "$utilization" -lt 30 ]; then
+  elif [ "$utilization" -lt "$FIDELITY_UPGRADE_THRESHOLD" ]; then
     # Upgrade fidelity
     case "$default_mode" in
       "compact") echo "summary:high" ;;
@@ -275,16 +286,21 @@ parse_satisfaction() {
   local result
   result=$(safe_jq "$json_file" '.result // ""' "")
   local score
-  score=$(echo "$result" | grep -oP '"aggregate"\s*:\s*\K[0-9.]+' || echo "0")
+  score=$(echo "$result" | sed -n 's/.*"aggregate"[[:space:]]*:[[:space:]]*\([0-9][0-9.]*\).*/\1/p' | head -1)
+  score="${score:-0}"
   score=$(validate_numeric "$score" "0")
   echo "$score"
 }
 
 score_to_verdict() {
   local score="$1"
-  if (( $(echo "$score >= 0.9" | bc -l) )); then echo "AUTO_PASS"
-  elif (( $(echo "$score >= 0.7" | bc -l) )); then echo "PASS_WITH_NOTES"
-  elif (( $(echo "$score >= 0.5" | bc -l) )); then echo "ITERATE"
+  local t_auto t_pass t_iterate
+  t_auto=$(echo "${THRESHOLD_AUTO_PASS} / 100" | bc -l)
+  t_pass=$(echo "${THRESHOLD_PASS} / 100" | bc -l)
+  t_iterate=$(echo "${THRESHOLD_ITERATE} / 100" | bc -l)
+  if (( $(echo "$score >= $t_auto" | bc -l) )); then echo "AUTO_PASS"
+  elif (( $(echo "$score >= $t_pass" | bc -l) )); then echo "PASS_WITH_NOTES"
+  elif (( $(echo "$score >= $t_iterate" | bc -l) )); then echo "ITERATE"
   else echo "BLOCK"
   fi
 }
@@ -319,8 +335,10 @@ IMPORTANT: When evaluating sections, read them in REVERSE order (last section fi
 
   # Compare verdicts - use stricter when they disagree
   local v1 v2
-  v1=$(safe_jq "${LOG_DIR}/${review_name}-pass1.json" '.result // ""' "" | grep -oP 'VERDICT: \K\w+' || echo "UNKNOWN")
-  v2=$(safe_jq "${LOG_DIR}/${review_name}-pass2.json" '.result // ""' "" | grep -oP 'VERDICT: \K\w+' || echo "UNKNOWN")
+  v1=$(safe_jq "${LOG_DIR}/${review_name}-pass1.json" '.result // ""' "" | extract_verdict)
+  v1="${v1:-UNKNOWN}"
+  v2=$(safe_jq "${LOG_DIR}/${review_name}-pass2.json" '.result // ""' "" | extract_verdict)
+  v2="${v2:-UNKNOWN}"
 
   if [ "$v1" = "$v2" ]; then
     echo "$v1"  # Consistent verdict
@@ -434,7 +452,7 @@ run_phase() {
   # Determine timeout: use phase-specific timeout if defined, else default 600s
   # Strip attempt/step/version suffixes but preserve base phase name
   # e.g. "implement-step-1-attempt-2" → "IMPLEMENT", "generate-docs-v2" → "GENERATE_DOCS"
-  local phase_timeout="${PHASE_TIMEOUT:-600}"
+  local phase_timeout="${PHASE_TIMEOUT:-$DEFAULT_TIMEOUT}"
   local base_phase="${phase_name%%-v[0-9]*}"
   base_phase="${base_phase%%-attempt-[0-9]*}"
   base_phase="${base_phase%%-step-[0-9a-z-]*}"
@@ -444,7 +462,7 @@ run_phase() {
   local timeout_var="TIMEOUT_${upper_phase}"
   if declare -p "$timeout_var" &>/dev/null; then
     phase_timeout="${!timeout_var}"
-    phase_timeout=$(validate_numeric "$phase_timeout" "600")
+    phase_timeout=$(validate_numeric "$phase_timeout" "$DEFAULT_TIMEOUT")
   fi
 
   # Run Claude in headless mode with structured output (Step 8: wrapped with timeout)
@@ -556,7 +574,7 @@ log "Logs: $LOG_DIR"
 
 if should_run_phase "phase0"; then
   run_phase "phase0" \
-    "You are running the Interrogation Protocol pipeline autonomously. Read CLAUDE.md first, then execute the phase0 context scan: scan git state, check Memory MCP for prior pipeline state, identify project type, TODOs, test status, blockers. Write a phase0-summary.md to docs/summaries/. Update Memory MCP with project_type, current_branch, test_status, blocker_count. Output must be under 20 lines." \
+    "You are running the Interrogation Protocol pipeline autonomously. Read CLAUDE.md first, then execute the phase0 context scan: scan git state, check Memory MCP for prior pipeline state, identify project type, TODOs, test status, blockers. Write a phase0-summary.md to ${SUMMARIES_DIR}/. Update Memory MCP with project_type, current_branch, test_status, blocker_count. Output must be under 20 lines." \
     "$TURNS_PHASE0" "$BUDGET_PHASE0" "--model $MODEL_PHASE0"
 fi
 
@@ -566,7 +584,7 @@ if should_run_phase "interrogate"; then
   run_phase "interrogate" \
     "You are running the Interrogation Protocol pipeline autonomously for ticket: ${TICKET}.
 
-Read CLAUDE.md, then docs/summaries/phase0-summary.md for project context.
+Read CLAUDE.md, then ${SUMMARIES_DIR}/phase0-summary.md for project context.
 
 Execute the full interrogation protocol (all 13 sections from .claude/skills/interrogate/SKILL.md). You are in AUTONOMOUS MODE - there is no human to answer questions. For each section:
 1. Search MCP sources (Jira, Confluence, Slack, Google Drive) for answers
@@ -574,9 +592,9 @@ Execute the full interrogation protocol (all 13 sections from .claude/skills/int
 3. If you find an answer from a source, record it with the source citation
 4. If you cannot find an answer, make a REASONABLE ASSUMPTION based on context and mark it clearly as [ASSUMPTION: reason]
 
-Write ALL fetched MCP content to docs/artifacts/mcp-context-${DATE}.md.
-Write the full interrogation transcript to docs/artifacts/interrogation-${DATE}.md.
-Generate a pyramid summary to docs/summaries/interrogation-summary.md with:
+Write ALL fetched MCP content to ${ARTIFACTS_DIR}/mcp-context-${DATE}.md.
+Write the full interrogation transcript to ${ARTIFACTS_DIR}/interrogation-${DATE}.md.
+Generate a pyramid summary to ${SUMMARIES_DIR}/interrogation-summary.md with:
   - Executive: 5 lines (core problem, user, stack, key constraint, MVP)
   - Detailed: 50 lines (all requirements, one per line)
   - Assumptions: list all assumptions made with confidence level (high/medium/low)
@@ -589,7 +607,7 @@ fi
 if should_run_phase "interrogation-review"; then
   REVIEW_PROMPT="You are a REVIEWER agent. You did NOT write the interrogation output. Your job is to review it with fresh eyes.
 
-Read docs/summaries/interrogation-summary.md and docs/artifacts/interrogation-${DATE}.md.
+Read ${SUMMARIES_DIR}/interrogation-summary.md and ${ARTIFACTS_DIR}/interrogation-${DATE}.md.
 
 Evaluate:
 1. Are all 13 sections addressed? List any gaps.
@@ -600,8 +618,8 @@ Evaluate:
 Score each section 1-5 (5=complete, 1=missing). Calculate overall satisfaction: (sum of scores) / (13 * 5) as a percentage.
 Also output a JSON block with an \"aggregate\" field as a decimal (e.g. 0.78).
 
-Write your review to docs/artifacts/interrogation-review-${DATE}.md.
-Write a 10-line summary to docs/summaries/interrogation-review.md.
+Write your review to ${ARTIFACTS_DIR}/interrogation-review-${DATE}.md.
+Write a 10-line summary to ${SUMMARIES_DIR}/interrogation-review.md.
 
 If overall satisfaction >= 70%: output VERDICT: PASS
 If any section scores 1 or any assumption marked NEEDS_HUMAN: output VERDICT: NEEDS_HUMAN
@@ -624,7 +642,7 @@ Always include VERDICT: [PASS|NEEDS_HUMAN|ITERATE] as the last line of your resp
   if [ "$NEXT" = "interrogate" ]; then
     log_warn "Interrogation needs iteration. Re-running with review feedback."
     run_phase "interrogate-v2" \
-      "Re-run interrogation addressing the gaps identified in docs/summaries/interrogation-review.md. Focus on sections that scored below 3. Update docs/summaries/interrogation-summary.md and docs/artifacts/interrogation-${DATE}.md." \
+      "Re-run interrogation addressing the gaps identified in ${SUMMARIES_DIR}/interrogation-review.md. Focus on sections that scored below 3. Update ${SUMMARIES_DIR}/interrogation-summary.md and ${ARTIFACTS_DIR}/interrogation-${DATE}.md." \
       "$TURNS_INTERROGATE" "$BUDGET_INTERROGATE" "--model $MODEL_INTERROGATE"
   fi
 fi
@@ -643,22 +661,24 @@ if should_run_phase "generate-docs"; then
     run_phase "generate-docs" \
       "You are running the Interrogation Protocol pipeline autonomously.
 
-Read CLAUDE.md, then docs/summaries/interrogation-summary.md (Tier 2 - do NOT read the full interrogation transcript unless you need specific detail for a section).
+Read CLAUDE.md and CONTRIBUTING_AGENT.md (The Way), then ${SUMMARIES_DIR}/interrogation-summary.md (Tier 2 - do NOT read the full interrogation transcript unless you need specific detail for a section).
 
-Generate all applicable documents from docs/templates/:
+Generate all applicable documents from ${TEMPLATES_DIR}/:
 - PRD.md, APP_FLOW.md, TECH_STACK.md, DATA_MODELS.md
 - API_SPEC.md (if API project), FRONTEND_GUIDELINES.md (if frontend)
 - IMPLEMENTATION_PLAN.md, TESTING_PLAN.md
 - SECURITY_CHECKLIST.md, OBSERVABILITY.md, ROLLOUT_PLAN.md
 
+BDD REQUIREMENT: Every feature in PRD.md MUST include acceptance criteria in Given/When/Then (Gherkin) format. TESTING_PLAN.md MUST include executable specifications derived from these acceptance criteria.
+
 Write each to docs/[name].md. For each doc:
-1. Read the template from docs/templates/
+1. Read the template from ${TEMPLATES_DIR}/
 2. Fill it from the interrogation summary
 3. If detail needed, read specific sections from Tier 3 artifact
 4. Do NOT keep all docs in conversation after writing them
 
 After all docs are written:
-1. Write docs/summaries/documentation-summary.md (pyramid format)
+1. Write ${SUMMARIES_DIR}/documentation-summary.md (pyramid format)
 2. Update Memory MCP with pipeline_state=documented" \
       "$TURNS_GENERATE_DOCS" "$BUDGET_GENERATE_DOCS" "--model $MODEL_GENERATE_DOCS"
   fi
@@ -669,7 +689,7 @@ fi
 if should_run_phase "doc-review"; then
   DOC_REVIEW_PROMPT="You are a REVIEWER agent. Review the generated docs for completeness and consistency.
 
-Read docs/summaries/documentation-summary.md for overview.
+Read ${SUMMARIES_DIR}/documentation-summary.md for overview.
 Spot-check 3-4 docs by reading them: docs/PRD.md, docs/IMPLEMENTATION_PLAN.md, docs/TESTING_PLAN.md, docs/DATA_MODELS.md.
 
 Check:
@@ -691,7 +711,7 @@ Always include VERDICT: [PASS|ITERATE] as the last line."
   if [ "$DOC_NEXT" = "generate-docs" ]; then
     log_warn "Doc review needs iteration. Re-running doc generation with feedback."
     run_phase "generate-docs-v2" \
-      "Re-generate docs addressing the gaps identified in docs/summaries/ review files. Focus on sections flagged as incomplete or contradictory." \
+      "Re-generate docs addressing the gaps identified in ${SUMMARIES_DIR}/ review files. Focus on sections flagged as incomplete or contradictory." \
       "$TURNS_GENERATE_DOCS" "$BUDGET_GENERATE_DOCS" "--model $MODEL_GENERATE_DOCS"
   fi
 fi
@@ -701,7 +721,7 @@ fi
 # before any code is written.
 
 if should_run_phase "holdout-generate"; then
-  if [ -d ".holdouts" ] && ls .holdouts/holdout-001-*.md 1>/dev/null 2>&1; then
+  if [ -d "${HOLDOUTS_DIR}" ] && ls "${HOLDOUTS_DIR}"/holdout-001-*.md 1>/dev/null 2>&1; then
     log "Holdouts already exist, skipping generation."
   else
     run_phase "holdout-generate" \
@@ -716,7 +736,7 @@ Generate 8-12 adversarial test scenarios that:
 - Validate security assumptions
 - Check for reward-hacking anti-patterns (hardcoded returns, missing validation)
 
-Write each to .holdouts/holdout-NNN-[slug].md using the standard format.
+Write each to ${HOLDOUTS_DIR}/holdout-NNN-[slug].md using the standard format.
 Start numbering at 001." \
       "$TURNS_HOLDOUT" "$BUDGET_HOLDOUT" "--model $MODEL_HOLDOUT"
   fi
@@ -730,7 +750,8 @@ if should_run_phase "implement"; then
     --output-format json --max-turns 5 --max-budget-usd 1 2>/dev/null)
   result_text=$(echo "$raw_result" | jq -r '.result // ""' 2>/dev/null || echo "")
   # Try to extract JSON array - first try direct parse, then regex extraction
-  IMPL_STEPS=$(echo "$result_text" | jq -c '.' 2>/dev/null || echo "$result_text" | grep -oP '\[.*\]' 2>/dev/null || echo "[]")
+  IMPL_STEPS=$(echo "$result_text" | jq -c '.' 2>/dev/null || echo "$result_text" | sed -n 's/.*\(\[.*\]\).*/\1/p' | head -1)
+  IMPL_STEPS="${IMPL_STEPS:-[]}"
   # Validate it's actually a JSON array
   if ! echo "$IMPL_STEPS" | jq 'type == "array"' 2>/dev/null | grep -q true; then
     IMPL_STEPS="[]"
@@ -772,14 +793,17 @@ $(cat "${LOG_DIR}/verify-${STEP_ID}-attempt-$((attempt-1)).stderr" 2>/dev/null |
       run_phase "implement-${STEP_ID}-attempt-${attempt}" \
         "You are implementing step ${STEP_ID}: ${STEP_TITLE}
 
-Read CLAUDE.md for rules. Read docs/summaries/documentation-summary.md for context.
+Read CLAUDE.md for rules. Read ${SUMMARIES_DIR}/documentation-summary.md for context.
 Read the specific doc sections relevant to this step.
 
 Description: ${STEP_DESC}
 
 ${ERROR_CONTEXT}
 
-Implement this step. Follow existing codebase patterns. Type everything. Handle all errors.
+Follow The Way (CONTRIBUTING_AGENT.md):
+1. RED: Write executable specifications (tests) for this step's behavior FIRST. Run them and confirm they fail.
+2. GREEN: Write only the code required to make the specs pass. Follow existing codebase patterns. Type everything. Handle all errors.
+3. REFACTOR: Clean up only while all specs remain green.
 After implementation, run the project's type checker and linter to verify your changes compile.
 Commit your changes with message: 'feat(${STEP_ID}): ${STEP_TITLE}'" \
         "$TURNS_IMPLEMENT" "$BUDGET_IMPLEMENT" "--model $MODEL_IMPLEMENT"
@@ -823,7 +847,8 @@ Always include VERDICT: [PASS|FAIL] as the last line." \
       fi
       set -e
 
-      VERIFY_VERDICT=$(jq -r '.result // ""' "${LOG_DIR}/verify-${STEP_ID}-attempt-${attempt}.json" 2>/dev/null | grep -oP 'VERDICT: \K\w+' || echo "UNKNOWN")
+      VERIFY_VERDICT=$(jq -r '.result // ""' "${LOG_DIR}/verify-${STEP_ID}-attempt-${attempt}.json" 2>/dev/null | extract_verdict)
+      VERIFY_VERDICT="${VERIFY_VERDICT:-UNKNOWN}"
       case "$VERIFY_VERDICT" in PASS|AUTO_PASS|PASS_WITH_NOTES|FAIL|ITERATE|UNKNOWN) ;; *) log_warn "Unexpected verify verdict: $VERIFY_VERDICT"; VERIFY_VERDICT="UNKNOWN" ;; esac
 
       if [ "$VERIFY_VERDICT" = "PASS" ]; then
@@ -856,11 +881,11 @@ fi
 # ---- Stage 7: Holdout Validation ----
 
 if should_run_phase "holdout-validate"; then
-  if ls .holdouts/holdout-*.md 1>/dev/null 2>&1; then
+  if ls "${HOLDOUTS_DIR}"/holdout-*.md 1>/dev/null 2>&1; then
     run_phase "holdout-validate" \
       "You are a HOLDOUT VALIDATION agent. Test the implementation against hidden scenarios.
 
-Read each file in .holdouts/holdout-*.md. For each scenario:
+Read each file in ${HOLDOUTS_DIR}/holdout-*.md. For each scenario:
 1. Check if preconditions can be met in the current implementation
 2. Walk through each step against the actual code
 3. Evaluate each acceptance criterion (pass/fail)
@@ -873,7 +898,8 @@ If < 80% or any anti-pattern flags: VERDICT: FAIL with details.
 Always include VERDICT: [PASS|FAIL] as the last line." \
       "$TURNS_HOLDOUT" "$BUDGET_HOLDOUT" "--model $MODEL_HOLDOUT"
 
-    HOLDOUT_VERDICT=$(jq -r '.result // ""' "${LOG_DIR}/holdout-validate.json" 2>/dev/null | grep -oP 'VERDICT: \K\w+' || echo "UNKNOWN")
+    HOLDOUT_VERDICT=$(jq -r '.result // ""' "${LOG_DIR}/holdout-validate.json" 2>/dev/null | extract_verdict)
+    HOLDOUT_VERDICT="${HOLDOUT_VERDICT:-UNKNOWN}"
     case "$HOLDOUT_VERDICT" in PASS|AUTO_PASS|PASS_WITH_NOTES|FAIL|UNKNOWN) ;; *) log_warn "Unexpected holdout verdict: $HOLDOUT_VERDICT"; HOLDOUT_VERDICT="UNKNOWN" ;; esac
     HOLDOUT_NEXT=$(route_from_gate "holdout-validate" "$HOLDOUT_VERDICT")
 
@@ -909,13 +935,14 @@ If any BLOCKERs: VERDICT: FAIL with file:line and description
 Always include VERDICT: [PASS|FAIL] as the last line." \
     "$TURNS_SECURITY" "$BUDGET_SECURITY" "--model $MODEL_SECURITY"
 
-  SECURITY_VERDICT=$(jq -r '.result // ""' "${LOG_DIR}/security-audit.json" 2>/dev/null | grep -oP 'VERDICT: \K\w+' || echo "UNKNOWN")
+  SECURITY_VERDICT=$(jq -r '.result // ""' "${LOG_DIR}/security-audit.json" 2>/dev/null | extract_verdict)
+  SECURITY_VERDICT="${SECURITY_VERDICT:-UNKNOWN}"
   SECURITY_NEXT=$(route_from_gate "security-audit" "$SECURITY_VERDICT")
 
   if [ "$SECURITY_NEXT" = "implement" ]; then
     log_warn "Security audit found blockers. Attempting auto-fix."
     run_phase "security-fix" \
-      "Read docs/artifacts/pipeline-runs/${DATE}/security-audit.json. Fix all BLOCKER-severity issues. Do not change functionality, only fix security issues. Commit with message 'fix(security): address audit findings'" \
+      "Read ${ARTIFACTS_DIR}/pipeline-runs/${DATE}/security-audit.json. Fix all BLOCKER-severity issues. Do not change functionality, only fix security issues. Commit with message 'fix(security): address audit findings'" \
       "$TURNS_IMPLEMENT" "$BUDGET_IMPLEMENT" "--model $MODEL_IMPLEMENT"
     after_phase "security-fix"
   fi
@@ -934,7 +961,7 @@ Pre-flight checks:
 
 If all pass, create a PR:
 - Title: '${TICKET}: [generated title from PRD]'
-- Body: built from docs/summaries/ (executive sections only)
+- Body: built from ${SUMMARIES_DIR}/ (executive sections only)
 - Include: test results, step count, holdout results if applicable
 
 Push branch and create PR via gh CLI or GitHub MCP.
