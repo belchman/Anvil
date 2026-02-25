@@ -1,6 +1,6 @@
 # Interrogation Protocol v3.0
 
-**Read CONTRIBUTING_AGENT.md for The Way.** It governs all work in this repository.
+**Read CONTRIBUTING_AGENT.md for the development process.** It governs all work in this repository.
 
 ## Quick Reference
 - Autonomous: `./run-pipeline.sh TICKET-ID`

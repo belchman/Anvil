@@ -111,7 +111,7 @@ The agent asks the human for input at each decision point. No assumptions are ma
 ```
 .
 ├── CLAUDE.md                          # Quick reference (< 50 lines)
-├── CONTRIBUTING_AGENT.md              # The Way - BDD discipline for agents
+├── CONTRIBUTING_AGENT.md              # Development process - BDD discipline for agents
 ├── run-pipeline.sh                    # Bash pipeline harness
 ├── run_pipeline.py                    # Python Agent SDK alternative
 ├── pipeline.config.sh                 # Phase limits configuration

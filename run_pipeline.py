@@ -20,6 +20,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from dataclasses import dataclass, field
 
+# Vendor boundary: Python runner is coupled to Claude Agent SDK.
+# AGENT_COMMAND only applies to bash runner.
 from claude_agent_sdk import (
     ClaudeAgent,
     AgentConfig,
@@ -41,7 +43,9 @@ MODELS = {
     "implement": "claude-opus-4-6",
     "verify": "claude-sonnet-4-5-20250929",
     "security": "claude-sonnet-4-5-20250929",
-    "holdout": "claude-sonnet-4-5-20250929",
+    "holdout_generate": "claude-opus-4-6",
+    "holdout_validate": "claude-sonnet-4-5-20250929",
+    "write_specs": "claude-sonnet-4-5-20250929",
     "ship": "claude-sonnet-4-5-20250929",
 }
 
@@ -56,8 +60,8 @@ _config: dict[str, str] = {}
 # Fallback defaults — overridden by pipeline.config.sh in main()
 PHASE_ORDER = [
     "phase0", "interrogate", "interrogation-review", "generate-docs",
-    "doc-review", "holdout-generate", "implement", "holdout-validate",
-    "security-audit", "ship",
+    "doc-review", "write-specs", "holdout-generate", "implement",
+    "holdout-validate", "security-audit", "ship",
 ]
 
 
@@ -130,7 +134,7 @@ def has_agent_teams() -> bool:
     """Check if Claude CLI supports agent teams."""
     try:
         output = subprocess.check_output(
-            ["claude", "--version"], stderr=subprocess.DEVNULL, text=True
+            [_config.get("AGENT_COMMAND", "claude"), "--version"], stderr=subprocess.DEVNULL, text=True
         )
         return "agent-teams" in output
     except (subprocess.CalledProcessError, FileNotFoundError):
@@ -245,9 +249,44 @@ class PipelineState:
         if self.total_cost > self.max_cost:
             raise RuntimeError(f"Cost ceiling exceeded: ${self.total_cost:.2f} > ${self.max_cost:.2f}")
 
+    resolved_tier: str = ""
+
+    def tier_allows_phase(self, phase: str) -> bool:
+        """Check if the current pipeline tier allows this phase."""
+        if not self.resolved_tier:
+            self.resolved_tier = _config.get("PIPELINE_TIER", "full")
+            if self.resolved_tier == "auto":
+                # Read scope from phase0 output
+                phase0_file = self.log_dir / "phase0.json"
+                scope = 3
+                if phase0_file.exists():
+                    result = json.loads(phase0_file.read_text()).get("result", "")
+                    match = re.search(r'SCOPE:\s*([1-5])', result)
+                    if match:
+                        scope = int(match.group(1))
+                if scope <= 1:
+                    self.resolved_tier = "nano"
+                elif scope <= 2:
+                    self.resolved_tier = "quick"
+                elif scope <= 3:
+                    self.resolved_tier = "standard"
+                else:
+                    self.resolved_tier = "full"
+                print(f"  Auto-tier: scope={scope} -> tier={self.resolved_tier}")
+
+        skip_phases: dict[str, set[str]] = {
+            "nano": {"interrogation-review", "generate-docs", "doc-review", "write-specs", "holdout-generate", "holdout-validate", "security-audit"},
+            "quick": {"write-specs", "holdout-generate", "holdout-validate", "security-audit"},
+            "standard": {"holdout-generate", "holdout-validate"},
+        }
+        return phase not in skip_phases.get(self.resolved_tier, set())
+
     def should_run_phase(self, phase: str) -> bool:
         """Check if phase should run (skip completed phases when resuming)."""
         if not self.resume_phase:
+            if not self.tier_allows_phase(phase):
+                print(f"  Skipping {phase} (tier: {self.resolved_tier})")
+                return False
             return True
 
         # Skip phases before resume point
@@ -266,6 +305,30 @@ class PipelineState:
         if phase in completed_phases:
             print(f"  Skipping {phase} (already completed)")
             return False
+
+        # Tier filtering
+        if not self.tier_allows_phase(phase):
+            print(f"  Skipping {phase} (tier: {self.resolved_tier})")
+            return False
+
+        # Doc generation mode filtering
+        if _config.get("DOC_TEMPLATES_MODE", "auto") == "none" and phase in ("generate-docs", "doc-review"):
+            print(f"  Skipping {phase} (DOC_TEMPLATES_MODE=none)")
+            return False
+
+        # Human gate check
+        human_gates = [g.strip() for g in _config.get("HUMAN_GATES", "").split(",") if g.strip()]
+        if phase in human_gates:
+            approval_file = self.log_dir / f"{phase}.human-approved"
+            if approval_file.exists():
+                print(f"  Human gate for {phase}: approved")
+            else:
+                print(f"  [WARN] Human gate: {phase} requires human approval before proceeding.")
+                print(f"  Review output in {self.log_dir}/, then: touch {approval_file}")
+                print(f"  Resume with: python run_pipeline.py \"{self.ticket}\" --resume {self.log_dir}")
+                self.status = "needs_human_gate"
+                self.save_checkpoint()
+                sys.exit(2)
 
         return True
 
@@ -469,6 +532,18 @@ async def run_review_with_bias_check(
     max_budget_usd: float = 3.0,
 ) -> str:
     """Dual-pass review with position bias mitigation. Returns verdict."""
+    # Standard tier: single-pass review (skip bias check for speed)
+    resolved = state.resolved_tier or _config.get("PIPELINE_TIER", "full")
+    if resolved in ("standard", "quick"):
+        single = await run_phase(state, PhaseConfig(
+            name=review_name,
+            prompt=prompt_base,
+            model=model,
+            max_turns=max_turns,
+            max_budget_usd=max_budget_usd,
+        ))
+        return single.verdict
+
     # Pass 1: normal order
     pass1 = await run_phase(state, PhaseConfig(
         name=f"{review_name}-pass1",
@@ -494,13 +569,35 @@ async def run_review_with_bias_check(
 
     v1, v2 = pass1.verdict, pass2.verdict
 
-    if v1 == v2:
-        return v1
+    # External validator pass (optional 3rd-party review)
+    v_ext = ""
+    ext_cmd = _config.get("REVIEW_VALIDATOR_COMMAND", "")
+    if ext_cmd:
+        try:
+            pass1_file = state.log_dir / f"{review_name}-pass1.json"
+            if pass1_file.exists():
+                proc = subprocess.run(
+                    ext_cmd, shell=True, input=pass1_file.read_text(),
+                    capture_output=True, text=True, timeout=120,
+                )
+                v_ext = parse_verdict(proc.stdout)
+                if v_ext != "UNKNOWN":
+                    print(f"  External validator verdict: {v_ext}")
+        except (subprocess.TimeoutExpired, Exception) as e:
+            print(f"  [WARN] External validator failed: {e}")
 
-    # Stricter verdict wins
-    print(f"  [WARN] Position bias: pass1={v1}, pass2={v2}. Using stricter.")
+    # Reconcile verdicts — strictest wins
+    all_verdicts = [v for v in (v1, v2, v_ext) if v and v != "UNKNOWN"]
+    if len(set(all_verdicts)) == 1:
+        return all_verdicts[0]
+
+    if v1 != v2:
+        print(f"  [WARN] Position bias: pass1={v1}, pass2={v2}. Using stricter.")
+    if v_ext and v_ext != "UNKNOWN" and v_ext != v1:
+        print(f"  [WARN] External validator disagrees: ext={v_ext}")
+
     for strict in ("FAIL", "ITERATE", "NEEDS_HUMAN"):
-        if v1 == strict or v2 == strict:
+        if strict in all_verdicts:
             return strict
     return v1
 
@@ -517,9 +614,9 @@ def route_from_gate(gate: str, verdict: str, retries: int = 0) -> str:
         "interrogation-review:ITERATE": "interrogate",
         "interrogation-review:NEEDS_HUMAN": "BLOCKED",
         "interrogation-review:BLOCK": "BLOCKED",
-        "doc-review:AUTO_PASS": "holdout-generate",
-        "doc-review:PASS_WITH_NOTES": "holdout-generate",
-        "doc-review:PASS": "holdout-generate",
+        "doc-review:AUTO_PASS": "write-specs",
+        "doc-review:PASS_WITH_NOTES": "write-specs",
+        "doc-review:PASS": "write-specs",
         "doc-review:ITERATE": "generate-docs",
         "holdout-validate:AUTO_PASS": "security-audit",
         "holdout-validate:PASS_WITH_NOTES": "security-audit",
@@ -610,20 +707,37 @@ async def implement_and_verify(
                     "Try a fundamentally different approach."
                 )
 
+        # Determine BDD mode based on whether write-specs ran
+        summaries_dir = _config.get('SUMMARIES_DIR', 'docs/summaries')
+        specs_summary = Path(summaries_dir) / "write-specs-summary.md"
+        if specs_summary.exists():
+            bdd_prompt = (
+                f"Executable specifications (tests) have already been written by a separate agent and are committed.\n"
+                f"Read {specs_summary} to see what specs exist for this step.\n\n"
+                f"Follow CONTRIBUTING_AGENT.md — GREEN + REFACTOR only:\n"
+                f"1. GREEN: Write only the code required to make the existing failing specs pass. Follow existing codebase patterns. Type everything. Handle all errors.\n"
+                f"2. REFACTOR: Clean up only while all specs remain green.\n"
+                f"Do NOT modify test files unless a spec is demonstrably impossible to satisfy (e.g., tests a non-existent API). If you must change a spec, document why in your commit message."
+            )
+        else:
+            bdd_prompt = (
+                f"Follow CONTRIBUTING_AGENT.md:\n"
+                f"1. RED: Write executable specifications (tests) for this step's behavior FIRST. Run them and confirm they fail.\n"
+                f"2. GREEN: Write only the code required to make the specs pass. Follow existing codebase patterns. Type everything. Handle all errors.\n"
+                f"3. REFACTOR: Clean up only while all specs remain green."
+            )
+
         # Implement
         impl_timeout = get_phase_timeout(_config, f"implement-{step.id}")
         await run_phase(state, PhaseConfig(
             name=f"implement-{step.id}-attempt-{attempt}",
             prompt=(
                 f"You are implementing step {step.id}: {step.title}\n\n"
-                f"Read CLAUDE.md for rules. Read {_config.get('SUMMARIES_DIR', 'docs/summaries')}/documentation-summary.md for context.\n"
+                f"Read CLAUDE.md for rules. Read {summaries_dir}/documentation-summary.md for context.\n"
                 f"Read the specific doc sections relevant to this step.\n\n"
                 f"Description: {step.description}\n\n"
                 f"{error_context}\n\n"
-                f"Follow The Way (CONTRIBUTING_AGENT.md):\n"
-                f"1. RED: Write executable specifications (tests) for this step's behavior FIRST. Run them and confirm they fail.\n"
-                f"2. GREEN: Write only the code required to make the specs pass. Follow existing codebase patterns. Type everything. Handle all errors.\n"
-                f"3. REFACTOR: Clean up only while all specs remain green.\n"
+                f"{bdd_prompt}\n"
                 f"After implementation, run the project's type checker and linter to verify your changes compile.\n"
                 f"Commit your changes with message: 'feat({step.id}): {step.title}'"
             ),
@@ -710,7 +824,9 @@ async def main():
         "implement": _config.get("MODEL_IMPLEMENT", MODELS["implement"]),
         "verify": _config.get("MODEL_VERIFY", MODELS["verify"]),
         "security": _config.get("MODEL_SECURITY", MODELS["security"]),
-        "holdout": _config.get("MODEL_HOLDOUT", MODELS["holdout"]),
+        "holdout_generate": _config.get("MODEL_HOLDOUT_GENERATE", MODELS["holdout_generate"]),
+        "holdout_validate": _config.get("MODEL_HOLDOUT_VALIDATE", MODELS["holdout_validate"]),
+        "write_specs": _config.get("MODEL_WRITE_SPECS", MODELS["write_specs"]),
         "ship": _config.get("MODEL_SHIP", MODELS["ship"]),
     }
     MAX_VERIFY_RETRIES = get_config_int(_config, "MAX_VERIFY_RETRIES", 3)
@@ -759,7 +875,15 @@ async def main():
                     "You are running the Interrogation Protocol pipeline autonomously. "
                     "Read CLAUDE.md first, then execute the phase0 context scan: scan git state, "
                     "check Memory MCP for prior pipeline state, identify project type, TODOs, test status, blockers. "
-                    f"Write a phase0-summary.md to {_config.get('SUMMARIES_DIR', 'docs/summaries')}/. Output must be under 20 lines."
+                    f"Write a phase0-summary.md to {_config.get('SUMMARIES_DIR', 'docs/summaries')}/.\n\n"
+                    "After your scan, estimate the scope of the change on a 1-5 scale:\n"
+                    "1 = trivial (typo, config change, <10 lines)\n"
+                    "2 = small (single function/component, <50 lines)\n"
+                    "3 = medium (multiple files, new feature, <200 lines)\n"
+                    "4 = large (cross-cutting, new subsystem, <500 lines)\n"
+                    "5 = massive (architectural change, >500 lines)\n"
+                    "Output SCOPE: N (where N is 1-5) in your response.\n\n"
+                    "Output must be under 20 lines."
                 ),
                 model=MODELS["phase0"],
                 max_turns=15, max_budget_usd=2.0,
@@ -832,12 +956,22 @@ async def main():
                     timeout_seconds=get_phase_timeout(_config, "generate-docs"),
                 ))
             else:
+                # Adaptive template selection
+                tmpl_dir = _config.get('TEMPLATES_DIR', 'docs/templates')
+                tmpl_mode = _config.get('DOC_TEMPLATES_MODE', 'auto')
+                if tmpl_mode == "minimal":
+                    tmpl_instruction = f"Generate ONLY: PRD.md, IMPLEMENTATION_PLAN.md, TESTING_PLAN.md from {tmpl_dir}/. Skip all other templates."
+                elif tmpl_mode == "all":
+                    tmpl_instruction = f"Generate ALL documents from {tmpl_dir}/: PRD.md, APP_FLOW.md, TECH_STACK.md, DATA_MODELS.md, API_SPEC.md, FRONTEND_GUIDELINES.md, IMPLEMENTATION_PLAN.md, TESTING_PLAN.md, SECURITY_CHECKLIST.md, OBSERVABILITY.md, ROLLOUT_PLAN.md."
+                else:
+                    tmpl_instruction = f"Generate documents ADAPTIVELY from {tmpl_dir}/. ALWAYS: PRD.md, IMPLEMENTATION_PLAN.md, TESTING_PLAN.md. Generate others only if relevant to the project type. Skip templates that don't apply. Do not generate empty docs."
+
                 await run_phase(state, PhaseConfig(
                     name="generate-docs",
                     prompt=(
-                        f"Read CLAUDE.md and CONTRIBUTING_AGENT.md (The Way). "
-                        f"Generate all applicable documents from {_config.get('TEMPLATES_DIR', 'docs/templates')}/. "
+                        f"Read CLAUDE.md and CONTRIBUTING_AGENT.md (process rules). "
                         f"Read {_config.get('SUMMARIES_DIR', 'docs/summaries')}/interrogation-summary.md for requirements. "
+                        f"{tmpl_instruction} "
                         f"BDD REQUIREMENT: Every feature in PRD.md MUST include acceptance criteria in Given/When/Then (Gherkin) format. "
                         f"TESTING_PLAN.md MUST include executable specifications derived from these acceptance criteria. "
                         f"Write each to {_config.get('DOCS_DIR', 'docs')}/[name].md. After all docs: write {_config.get('SUMMARIES_DIR', 'docs/summaries')}/documentation-summary.md."
@@ -873,7 +1007,30 @@ async def main():
                     timeout_seconds=get_phase_timeout(_config, "generate-docs"),
                 ))
 
-        # ---- Stage 5b: Holdout Generation ----
+        # ---- Stage 5b: Write Executable Specifications (Cross-Model BDD) ----
+        if state.should_run_phase("write-specs"):
+            summaries_dir = _config.get("SUMMARIES_DIR", "docs/summaries")
+            _tid = threads.get_or_create("write-specs")
+            await run_phase(state, PhaseConfig(
+                name="write-specs",
+                prompt=(
+                    "You are a SPECIFICATION WRITER. You will NOT implement any code.\n\n"
+                    "Read CLAUDE.md and CONTRIBUTING_AGENT.md (process rules).\n"
+                    "Read docs/PRD.md, docs/IMPLEMENTATION_PLAN.md, docs/TESTING_PLAN.md.\n\n"
+                    "For each step in IMPLEMENTATION_PLAN.md:\n"
+                    "1. Write executable test specifications (Given/When/Then from PRD acceptance criteria)\n"
+                    "2. Write test files that encode these specifications\n"
+                    "3. Run them to confirm they FAIL (RED phase of BDD)\n"
+                    "4. Commit failing specs: 'test(spec): RED specs for [step]'\n\n"
+                    "You must NOT write any implementation code. Only tests. Only RED.\n"
+                    f"Write a summary to {summaries_dir}/write-specs-summary.md listing each spec file and what it tests."
+                ),
+                model=MODELS["write_specs"],
+                max_turns=30, max_budget_usd=5.0,
+                timeout_seconds=get_phase_timeout(_config, "write-specs"),
+            ))
+
+        # ---- Stage 5c: Holdout Generation ----
         holdouts_dir = Path(_config.get("HOLDOUTS_DIR", ".holdouts"))
         if state.should_run_phase("holdout-generate"):
             existing_holdouts = list(holdouts_dir.glob("holdout-001-*.md")) if holdouts_dir.exists() else []
@@ -886,7 +1043,7 @@ async def main():
                         "Read docs/PRD.md, docs/APP_FLOW.md, docs/API_SPEC.md, docs/DATA_MODELS.md. "
                         f"Generate 8-12 adversarial test scenarios. Write each to {_config.get('HOLDOUTS_DIR', '.holdouts')}/holdout-NNN-[slug].md."
                     ),
-                    model=MODELS["holdout"],
+                    model=MODELS["holdout_generate"],
                     max_turns=25, max_budget_usd=5.0,
                     timeout_seconds=get_phase_timeout(_config, "holdout-generate"),
                 ))
@@ -919,7 +1076,7 @@ async def main():
                         "If >= 80% and 0 anti-pattern flags: VERDICT: PASS. "
                         "If < 80%: VERDICT: FAIL. Always include VERDICT as last line."
                     ),
-                    model=MODELS["holdout"],
+                    model=MODELS["holdout_validate"],
                     max_turns=25, max_budget_usd=5.0,
                     timeout_seconds=get_phase_timeout(_config, "holdout-validate"),
                 ))
@@ -1005,6 +1162,35 @@ async def main():
         for p in state.phases:
             print(f"    {p.name}: ${p.cost_usd:.2f} ({p.turns} turns)")
         print(f"  Checkpoint: {state.log_dir / 'checkpoint.json'}")
+
+        # Record pipeline outcome metrics
+        metrics_file = Path(_config.get("METRICS_FILE", "docs/artifacts/pipeline-metrics.json"))
+        metrics_file.parent.mkdir(parents=True, exist_ok=True)
+        retry_count = sum(1 for p in state.phases if re.search(r'attempt-[2-9]', p.name))
+        run_entry = {
+            "ticket": ticket,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "tier": state.resolved_tier or _config.get("PIPELINE_TIER", "full"),
+            "total_cost_usd": state.total_cost,
+            "phases_run": len(state.phases),
+            "retry_count": retry_count,
+            "status": state.status,
+            "log_dir": str(state.log_dir),
+        }
+        try:
+            if metrics_file.exists():
+                metrics = json.loads(metrics_file.read_text())
+            else:
+                metrics = {"runs": [], "total_runs": 0, "total_cost_usd": 0.0}
+            metrics["runs"].append(run_entry)
+            metrics["total_runs"] += 1
+            metrics["total_cost_usd"] += state.total_cost
+            tmp = metrics_file.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(metrics, indent=2))
+            tmp.rename(metrics_file)
+            print(f"  Metrics appended to: {metrics_file}")
+        except Exception as e:
+            print(f"  [WARN] Could not write metrics: {e}")
 
 
 if __name__ == "__main__":

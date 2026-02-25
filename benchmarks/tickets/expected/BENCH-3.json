@@ -1,0 +1,32 @@
+{
+  "ticket": "BENCH-3",
+  "description": "Add test coverage",
+  "checks": [
+    {
+      "type": "file_unchanged",
+      "file": "tasktrack/store.py",
+      "description": "Source code not modified",
+      "weight": 20
+    },
+    {
+      "type": "file_unchanged",
+      "file": "tasktrack/cli.py",
+      "description": "CLI not modified",
+      "weight": 10
+    },
+    {
+      "type": "pytest",
+      "weight": 30
+    },
+    {
+      "type": "test_count_minimum",
+      "minimum": 8,
+      "weight": 25
+    },
+    {
+      "type": "test_count_increased",
+      "baseline": 5,
+      "weight": 15
+    }
+  ]
+}

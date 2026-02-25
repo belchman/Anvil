@@ -1,0 +1,29 @@
+{
+  "ticket": "BENCH-5",
+  "description": "Remove eval() vulnerability",
+  "checks": [
+    {
+      "type": "ast_parse",
+      "file": "tasktrack/store.py",
+      "weight": 15
+    },
+    {
+      "type": "grep_absent",
+      "file": "tasktrack/store.py",
+      "pattern": "eval\\(",
+      "description": "eval() removed from store.py",
+      "weight": 40
+    },
+    {
+      "type": "pytest",
+      "weight": 30
+    },
+    {
+      "type": "grep_present",
+      "file": "tests/test_store.py",
+      "pattern": "def test.*(corrupt|invalid|malform)",
+      "description": "Test for corrupt file handling",
+      "weight": 15
+    }
+  ]
+}

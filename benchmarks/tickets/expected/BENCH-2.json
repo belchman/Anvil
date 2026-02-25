@@ -1,0 +1,36 @@
+{
+  "ticket": "BENCH-2",
+  "description": "Add search feature",
+  "checks": [
+    {
+      "type": "ast_parse",
+      "file": "tasktrack/store.py",
+      "weight": 10
+    },
+    {
+      "type": "grep_present",
+      "file": "tasktrack/store.py",
+      "pattern": "def search\\(",
+      "description": "search() method exists",
+      "weight": 25
+    },
+    {
+      "type": "grep_present",
+      "file": "tasktrack/cli.py",
+      "pattern": "search",
+      "description": "CLI search subcommand exists",
+      "weight": 15
+    },
+    {
+      "type": "pytest",
+      "weight": 30
+    },
+    {
+      "type": "grep_present",
+      "file": "tests/test_store.py",
+      "pattern": "def test.*search",
+      "description": "Search test exists",
+      "weight": 20
+    }
+  ]
+}

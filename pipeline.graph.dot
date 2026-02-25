@@ -8,6 +8,7 @@ digraph pipeline {
   interrogation_review [label="Interrogation Review" shape=diamond]
   generate_docs [label="Doc Generation"]
   doc_review [label="Doc Review" shape=diamond]
+  write_specs [label="Write Specs\n(cross-model BDD)"]
   holdout_generate [label="Holdout Generation"]
   implement [label="Implementation"]
   verify [label="Verify Gate" shape=diamond]
@@ -27,7 +28,8 @@ digraph pipeline {
 
   // Doc generation routing
   generate_docs -> doc_review [label="always"]
-  doc_review -> holdout_generate [label="PASS (>= THRESHOLD_DOC_REVIEW)"]
+  doc_review -> write_specs [label="PASS (>= THRESHOLD_DOC_REVIEW)"]
+  write_specs -> holdout_generate [label="always"]
   doc_review -> generate_docs [label="ITERATE" style=dashed]
 
   holdout_generate -> implement [label="always"]

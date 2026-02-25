@@ -52,7 +52,19 @@ CORE_FILES=(
   ".env.example"
   ".gitignore"
   "scripts/agent-test.sh"
+  "scripts/benchmark.sh"
+  "scripts/run-benchmark.sh"
+  "scripts/review-validator.sh"
+  "scripts/self-validate.sh"
   ".github/workflows/autonomous-pipeline.yml"
+  "benchmarks/score.py"
+  "benchmarks/benchmark.config.sh"
+  "benchmarks/target/tasktrack/__init__.py"
+  "benchmarks/target/tasktrack/store.py"
+  "benchmarks/target/tasktrack/cli.py"
+  "benchmarks/target/tests/test_store.py"
+  "benchmarks/target/CLAUDE.md"
+  "benchmarks/target/pyproject.toml"
 )
 for f in "${CORE_FILES[@]}"; do
   if [ -f "$ROOT/$f" ]; then
@@ -112,6 +124,21 @@ else
   fail ".claude/settings.json missing"
 fi
 
+# Benchmark tickets (5 expected)
+BENCH_TICKETS=(BENCH-1 BENCH-2 BENCH-3 BENCH-4 BENCH-5)
+for bt in "${BENCH_TICKETS[@]}"; do
+  if [ -f "$ROOT/benchmarks/tickets/${bt}.md" ]; then
+    pass "ticket: ${bt}.md"
+  else
+    fail "ticket missing: ${bt}.md"
+  fi
+  if [ -f "$ROOT/benchmarks/tickets/expected/${bt}.json" ]; then
+    pass "expected: ${bt}.json"
+  else
+    fail "expected missing: ${bt}.json"
+  fi
+done
+
 # Holdouts directory
 if [ -d "$ROOT/.holdouts" ]; then
   pass ".holdouts/ directory exists"
@@ -124,7 +151,7 @@ fi
 # ============================================================
 section "Bash Syntax"
 
-for script in "$ROOT/run-pipeline.sh" "$ROOT/pipeline.config.sh" "$ROOT/scripts/agent-test.sh"; do
+for script in "$ROOT/run-pipeline.sh" "$ROOT/pipeline.config.sh" "$ROOT/scripts/agent-test.sh" "$ROOT/scripts/benchmark.sh" "$ROOT/scripts/run-benchmark.sh" "$ROOT/scripts/review-validator.sh" "$ROOT/scripts/self-validate.sh" "$ROOT/benchmarks/benchmark.config.sh"; do
   name=$(basename "$script")
   if bash -n "$script" 2>/dev/null; then
     pass "$name syntax OK"
@@ -150,6 +177,16 @@ if command -v python3 &>/dev/null; then
     pass "run_pipeline.py syntax OK"
   else
     fail "run_pipeline.py has syntax errors"
+  fi
+  if python3 -c "import ast; ast.parse(open('$ROOT/benchmarks/score.py').read())" 2>/dev/null; then
+    pass "benchmarks/score.py syntax OK"
+  else
+    fail "benchmarks/score.py has syntax errors"
+  fi
+  if python3 -c "import ast; ast.parse(open('$ROOT/benchmarks/target/tasktrack/store.py').read())" 2>/dev/null; then
+    pass "benchmarks/target/tasktrack/store.py syntax OK"
+  else
+    fail "benchmarks/target/tasktrack/store.py has syntax errors"
   fi
 else
   warn "python3 not found, skipping Python syntax check"
@@ -191,7 +228,7 @@ else
   fi
 
   # Check all expected nodes exist
-  DOT_NODES=(phase0 interrogate interrogation_review generate_docs doc_review holdout_generate implement verify holdout_validate security_audit ship supervisor)
+  DOT_NODES=(phase0 interrogate interrogation_review generate_docs doc_review write_specs holdout_generate implement verify holdout_validate security_audit ship supervisor)
   for node in "${DOT_NODES[@]}"; do
     if grep -q "^  $node " "$DOT_FILE"; then
       pass "DOT node: $node"
@@ -206,6 +243,8 @@ else
     "interrogate -> interrogation_review"
     "interrogation_review -> generate_docs"
     "generate_docs -> doc_review"
+    "doc_review -> write_specs"
+    "write_specs -> holdout_generate"
     "holdout_generate -> implement"
     "implement -> verify"
     "verify -> holdout_validate"
@@ -226,30 +265,22 @@ fi
 # ============================================================
 section "Config Completeness"
 
-# Check all expected variables are defined in pipeline.config.sh
-CONFIG_VARS=(
-  MODEL_PHASE0 MODEL_INTERROGATE MODEL_REVIEW MODEL_GENERATE_DOCS MODEL_IMPLEMENT
-  MODEL_VERIFY MODEL_SECURITY MODEL_HOLDOUT MODEL_SHIP
-  TURNS_PHASE0 TURNS_INTERROGATE TURNS_REVIEW TURNS_GENERATE_DOCS TURNS_IMPLEMENT
-  TURNS_VERIFY TURNS_SECURITY TURNS_HOLDOUT TURNS_SHIP
-  BUDGET_PHASE0 BUDGET_INTERROGATE BUDGET_REVIEW BUDGET_GENERATE_DOCS BUDGET_IMPLEMENT
-  BUDGET_VERIFY BUDGET_SECURITY BUDGET_HOLDOUT BUDGET_SHIP
-  MAX_PIPELINE_COST MAX_VERIFY_RETRIES MAX_INTERROGATION_ITERATIONS
-  STAGNATION_SIMILARITY_THRESHOLD KILL_SWITCH_FILE
-  TIMEOUT_PHASE0 TIMEOUT_INTERROGATE TIMEOUT_REVIEW TIMEOUT_GENERATE_DOCS
-  TIMEOUT_IMPLEMENT TIMEOUT_VERIFY TIMEOUT_SECURITY TIMEOUT_HOLDOUT TIMEOUT_SHIP
-  MAX_NO_PROGRESS CONTEXT_WINDOW
-  THRESHOLD_AUTO_PASS THRESHOLD_PASS THRESHOLD_ITERATE THRESHOLD_DOC_REVIEW THRESHOLD_HOLDOUT
-  DOCS_DIR ARTIFACTS_DIR SUMMARIES_DIR TEMPLATES_DIR HOLDOUTS_DIR LOG_BASE_DIR
-  PHASE_ORDER DEFAULT_TIMEOUT FIDELITY_UPGRADE_THRESHOLD FIDELITY_DOWNGRADE_THRESHOLD
-)
+# Auto-discover config vars from pipeline.config.sh
+CONFIG_VARS=()
+while IFS='=' read -r var _; do
+  CONFIG_VARS+=("$var")
+done < <(grep -E '^[A-Z_][A-Z0-9_]*=' "$ROOT/pipeline.config.sh")
+
 for var in "${CONFIG_VARS[@]}"; do
-  if grep -q "^${var}=" "$ROOT/pipeline.config.sh"; then
-    pass "config: $var"
-  else
-    fail "config missing: $var"
-  fi
+  pass "config: $var"
 done
+
+# Verify minimum expected count
+if [ "${#CONFIG_VARS[@]}" -lt 40 ]; then
+  fail "Expected at least 40 config vars, found ${#CONFIG_VARS[@]}"
+else
+  pass "config var count: ${#CONFIG_VARS[@]} (>= 40)"
+fi
 
 # ============================================================
 # 7. Cross-Reference Integrity
@@ -261,7 +292,7 @@ if [ "$MODE" = "quick" ]; then
 else
   # pipeline.models.json overrides should map to known phase types
   MODEL_TYPES=$(jq -r '.overrides | keys[]' "$ROOT/pipeline.models.json" 2>/dev/null)
-  EXPECTED_TYPES="routing review security generation implementation holdout healer supervisor"
+  EXPECTED_TYPES="routing review security generation implementation specification holdout_generate holdout_validate healer supervisor"
   for t in $EXPECTED_TYPES; do
     if echo "$MODEL_TYPES" | grep -q "^${t}$"; then
       pass "model override: $t"

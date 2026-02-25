@@ -6,7 +6,9 @@
     "security": "claude-sonnet-4-5-20250929",
     "generation": "claude-opus-4-6",
     "implementation": "claude-opus-4-6",
-    "holdout": "claude-sonnet-4-5-20250929",
+    "specification": "claude-sonnet-4-5-20250929",
+    "holdout_generate": "claude-opus-4-6",
+    "holdout_validate": "claude-sonnet-4-5-20250929",
     "healer": "claude-opus-4-6",
     "supervisor": "claude-sonnet-4-5-20250929"
   },

@@ -17,12 +17,33 @@ set -euo pipefail
 # ============================================================
 
 # ---- Pre-flight Checks ----
-for cmd in claude jq bc git; do
+for cmd in claude jq git; do
   if ! command -v "$cmd" &>/dev/null; then
     echo "[ERROR] Required command '$cmd' not found. Install it before running the pipeline."
     exit 1
   fi
 done
+
+# Optional dependencies with fallback
+HAS_BC=false
+if command -v bc &>/dev/null; then HAS_BC=true; fi
+HAS_GH=false
+if command -v gh &>/dev/null; then HAS_GH=true; fi
+if [ "$HAS_BC" = false ]; then
+  echo "[WARN] 'bc' not found. Using awk for floating-point math (less precise)."
+fi
+if [ "$HAS_GH" = false ]; then
+  echo "[WARN] 'gh' not found. PR creation in ship phase will be skipped."
+fi
+
+# Portable floating-point math: uses bc if available, awk otherwise
+float_calc() {
+  if [ "$HAS_BC" = true ]; then
+    echo "$1" | bc -l 2>/dev/null
+  else
+    awk "BEGIN { printf \"%.6f\", $1 }"
+  fi
+}
 
 if ! git rev-parse --git-dir >/dev/null 2>&1; then
   echo "[ERROR] Not inside a git repository. Run 'git init' first."
@@ -33,21 +54,18 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/pipeline.config.sh"
 
-# Validate numeric config values
-for _cfg_var in MAX_PIPELINE_COST MAX_VERIFY_RETRIES MAX_INTERROGATION_ITERATIONS \
-  STAGNATION_SIMILARITY_THRESHOLD MAX_NO_PROGRESS CONTEXT_WINDOW \
-  TURNS_PHASE0 TURNS_INTERROGATE TURNS_REVIEW TURNS_GENERATE_DOCS TURNS_IMPLEMENT \
-  TURNS_VERIFY TURNS_SECURITY TURNS_HOLDOUT TURNS_SHIP \
-  BUDGET_PHASE0 BUDGET_INTERROGATE BUDGET_REVIEW BUDGET_GENERATE_DOCS BUDGET_IMPLEMENT \
-  BUDGET_VERIFY BUDGET_SECURITY BUDGET_HOLDOUT BUDGET_SHIP \
-  TIMEOUT_PHASE0 TIMEOUT_INTERROGATE TIMEOUT_REVIEW TIMEOUT_GENERATE_DOCS \
-  TIMEOUT_IMPLEMENT TIMEOUT_VERIFY TIMEOUT_SECURITY TIMEOUT_HOLDOUT TIMEOUT_SHIP; do
+# Auto-discover and validate numeric config values from pipeline.config.sh
+while IFS='=' read -r _cfg_var _cfg_val; do
+  # Skip string configs by naming convention
+  case "$_cfg_var" in
+    *_DIR|*_FILE|*_ORDER|*_COMMAND|*_MODE|*_GATES|HOLDOUTS_DIR|PIPELINE_TIER) continue ;;
+  esac
   if ! [[ "${!_cfg_var:-}" =~ ^[0-9]+\.?[0-9]*$ ]]; then
     echo "[ERROR] Config variable $_cfg_var is not numeric: '${!_cfg_var:-}'"
     exit 1
   fi
-done
-unset _cfg_var
+done < <(grep -E '^[A-Z_][A-Z0-9_]*=' "${SCRIPT_DIR}/pipeline.config.sh")
+unset _cfg_var _cfg_val
 
 # ---- Helper Functions ----
 
@@ -168,7 +186,7 @@ check_kill_switch() {
 
 check_cost_ceiling() {
   local cost_exceeded
-  cost_exceeded=$(echo "$TOTAL_COST > $MAX_PIPELINE_COST" | bc -l 2>/dev/null) || cost_exceeded=0
+  cost_exceeded=$(float_calc "$TOTAL_COST > $MAX_PIPELINE_COST" | cut -d. -f1) || cost_exceeded=0
   cost_exceeded=$(validate_numeric "$cost_exceeded" "0")
   if [ "$cost_exceeded" -eq 1 ]; then
     log_error "Cost ceiling exceeded: \$${TOTAL_COST} > \$${MAX_PIPELINE_COST}"
@@ -234,6 +252,19 @@ should_run_phase() {
     log "Skipping $phase (already completed in previous run)"
     return 1
   fi
+  # Tier filtering
+  if ! tier_allows_phase "$phase"; then
+    log "Skipping $phase (tier: ${RESOLVED_TIER:-${PIPELINE_TIER:-full}})"
+    return 1
+  fi
+  # Doc generation mode filtering
+  if [ "${DOC_TEMPLATES_MODE:-auto}" = "none" ]; then
+    case "$phase" in
+      generate-docs|doc-review) log "Skipping $phase (DOC_TEMPLATES_MODE=none)"; return 1 ;;
+    esac
+  fi
+  # Human gate check (may exit with code 2 if approval needed)
+  check_human_gate "$phase"
   return 0
 }
 
@@ -252,7 +283,7 @@ select_fidelity() {
   fi
 
   local utilization
-  utilization=$(echo "($estimated_tokens * 100) / $window_size" | bc -l 2>/dev/null | cut -d. -f1)
+  utilization=$(float_calc "($estimated_tokens * 100) / $window_size" | cut -d. -f1)
   utilization=$(validate_numeric "$utilization" "50")
 
   if [ "$utilization" -gt "$FIDELITY_DOWNGRADE_THRESHOLD" ]; then
@@ -295,12 +326,12 @@ parse_satisfaction() {
 score_to_verdict() {
   local score="$1"
   local t_auto t_pass t_iterate
-  t_auto=$(echo "${THRESHOLD_AUTO_PASS} / 100" | bc -l)
-  t_pass=$(echo "${THRESHOLD_PASS} / 100" | bc -l)
-  t_iterate=$(echo "${THRESHOLD_ITERATE} / 100" | bc -l)
-  if (( $(echo "$score >= $t_auto" | bc -l) )); then echo "AUTO_PASS"
-  elif (( $(echo "$score >= $t_pass" | bc -l) )); then echo "PASS_WITH_NOTES"
-  elif (( $(echo "$score >= $t_iterate" | bc -l) )); then echo "ITERATE"
+  t_auto=$(float_calc "${THRESHOLD_AUTO_PASS} / 100")
+  t_pass=$(float_calc "${THRESHOLD_PASS} / 100")
+  t_iterate=$(float_calc "${THRESHOLD_ITERATE} / 100")
+  if (( $(float_calc "$score >= $t_auto" | cut -d. -f1) )); then echo "AUTO_PASS"
+  elif (( $(float_calc "$score >= $t_pass" | cut -d. -f1) )); then echo "PASS_WITH_NOTES"
+  elif (( $(float_calc "$score >= $t_iterate" | cut -d. -f1) )); then echo "ITERATE"
   else echo "BLOCK"
   fi
 }
@@ -315,6 +346,15 @@ run_review_with_bias_check() {
   local max_turns="$3"
   local max_budget="$4"
   local model="$5"
+
+  # Standard/quick tier: single-pass review (skip bias check for speed)
+  if [ "${RESOLVED_TIER:-full}" = "standard" ] || [ "${RESOLVED_TIER:-full}" = "quick" ]; then
+    run_phase "${review_name}" "$prompt_base" "$max_turns" "$max_budget" "--model $model"
+    local v1
+    v1=$(safe_jq "${LOG_DIR}/${review_name}.json" '.result // ""' "" | extract_verdict)
+    echo "${v1:-UNKNOWN}"
+    return
+  fi
 
   # Pass 1: normal order
   run_phase "${review_name}-pass1" "$prompt_base" "$max_turns" "$max_budget" "--model $model"
@@ -340,16 +380,37 @@ IMPORTANT: When evaluating sections, read them in REVERSE order (last section fi
   v2=$(safe_jq "${LOG_DIR}/${review_name}-pass2.json" '.result // ""' "" | extract_verdict)
   v2="${v2:-UNKNOWN}"
 
-  if [ "$v1" = "$v2" ]; then
-    echo "$v1"  # Consistent verdict
-  else
-    log_warn "Position bias detected: pass1=$v1, pass2=$v2. Using stricter verdict."
-    if [ "$v1" = "FAIL" ] || [ "$v2" = "FAIL" ]; then echo "FAIL"
-    elif [ "$v1" = "ITERATE" ] || [ "$v2" = "ITERATE" ]; then echo "ITERATE"
-    elif [ "$v1" = "NEEDS_HUMAN" ] || [ "$v2" = "NEEDS_HUMAN" ]; then echo "NEEDS_HUMAN"
-    else echo "$v1"
+  # External validator pass (optional 3rd-party review)
+  local v_ext=""
+  if [ -n "${REVIEW_VALIDATOR_COMMAND:-}" ]; then
+    log "Running external review validator: $REVIEW_VALIDATOR_COMMAND"
+    v_ext=$(cat "${LOG_DIR}/${review_name}-pass1.json" | $REVIEW_VALIDATOR_COMMAND 2>/dev/null | extract_verdict) || true
+    v_ext="${v_ext:-UNKNOWN}"
+    if [ "$v_ext" != "UNKNOWN" ]; then
+      log "External validator verdict: $v_ext"
     fi
   fi
+
+  # Reconcile verdicts — strictest wins
+  local final_verdict
+  if [ "$v1" = "$v2" ] && { [ -z "$v_ext" ] || [ "$v_ext" = "$v1" ] || [ "$v_ext" = "UNKNOWN" ]; }; then
+    final_verdict="$v1"  # All agree
+  else
+    if [ "$v1" != "$v2" ]; then
+      log_warn "Position bias detected: pass1=$v1, pass2=$v2. Using stricter verdict."
+    fi
+    if [ -n "$v_ext" ] && [ "$v_ext" != "UNKNOWN" ] && [ "$v_ext" != "$v1" ]; then
+      log_warn "External validator disagrees: ext=$v_ext. Including in strictness check."
+    fi
+    # Collect all verdicts and pick strictest
+    local all_verdicts="$v1 $v2 ${v_ext:-}"
+    if echo "$all_verdicts" | grep -qw "FAIL"; then final_verdict="FAIL"
+    elif echo "$all_verdicts" | grep -qw "ITERATE"; then final_verdict="ITERATE"
+    elif echo "$all_verdicts" | grep -qw "NEEDS_HUMAN"; then final_verdict="NEEDS_HUMAN"
+    else final_verdict="$v1"
+    fi
+  fi
+  echo "$final_verdict"
 }
 
 # ---- Graph-Based Routing (Step 6) ----
@@ -370,7 +431,7 @@ route_from_gate() {
     "interrogation-review:NEEDS_HUMAN"|"interrogation-review:BLOCK")
       echo "BLOCKED" ;;
     "doc-review:PASS"|"doc-review:AUTO_PASS"|"doc-review:PASS_WITH_NOTES")
-      echo "holdout-generate" ;;
+      echo "write-specs" ;;
     "doc-review:ITERATE")
       echo "generate-docs" ;;
     "verify:PASS"|"verify:AUTO_PASS"|"verify:PASS_WITH_NOTES")
@@ -467,7 +528,7 @@ run_phase() {
 
   # Run Claude in headless mode with structured output (Step 8: wrapped with timeout)
   set +e
-  timeout "$phase_timeout" claude -p "$prompt" \
+  timeout "$phase_timeout" "$AGENT_COMMAND" -p "$prompt" \
     --output-format json \
     --max-turns "$max_turns" \
     --max-budget-usd "$max_budget" \
@@ -491,7 +552,7 @@ run_phase() {
   num_turns=$(safe_jq "$output_file" '.num_turns // 0' "0")
 
   local new_total
-  new_total=$(echo "$TOTAL_COST + $phase_cost" | bc -l 2>/dev/null) || new_total="$TOTAL_COST"
+  new_total=$(float_calc "$TOTAL_COST + $phase_cost") || new_total="$TOTAL_COST"
   TOTAL_COST=$(validate_numeric "$new_total" "$TOTAL_COST")
 
   # Log cost
@@ -558,6 +619,73 @@ check_stagnation() {
   return 0
 }
 
+# ---- Human Gate Check ----
+# If a phase is listed in HUMAN_GATES, check whether a human has approved it.
+# Approval is signaled by the existence of ${LOG_DIR}/${phase}.human-approved
+
+check_human_gate() {
+  local phase="$1"
+  if [ -z "${HUMAN_GATES:-}" ]; then
+    return 0  # No human gates configured
+  fi
+  # Check if this phase is in the comma-separated HUMAN_GATES list
+  case ",$HUMAN_GATES," in
+    *,"$phase",*)
+      if [ -f "${LOG_DIR}/${phase}.human-approved" ]; then
+        log "Human gate for $phase: approved"
+        return 0
+      else
+        log_warn "Human gate: $phase requires human approval before proceeding."
+        log_warn "Review output in ${LOG_DIR}/, then: touch ${LOG_DIR}/${phase}.human-approved"
+        log_warn "Resume with: ./run-pipeline.sh \"$TICKET\" --resume $LOG_DIR"
+        update_checkpoint "needs_human_gate" "$phase"
+        exit 2
+      fi
+      ;;
+  esac
+  return 0
+}
+
+# ---- Tier-Based Phase Filtering ----
+RESOLVED_TIER=""
+
+tier_allows_phase() {
+  local phase="$1"
+
+  # Resolve tier once (after phase0 runs)
+  if [ -z "$RESOLVED_TIER" ]; then
+    RESOLVED_TIER="${PIPELINE_TIER:-full}"
+    if [ "$RESOLVED_TIER" = "auto" ]; then
+      local scope
+      scope=$(safe_jq "${LOG_DIR}/phase0.json" '.result // ""' "" | sed -n 's/.*SCOPE: \([1-5]\).*/\1/p' | tail -1)
+      scope=$(validate_numeric "$scope" "3")
+      if [ "$scope" -le 1 ]; then RESOLVED_TIER="nano"
+      elif [ "$scope" -le 2 ]; then RESOLVED_TIER="quick"
+      elif [ "$scope" -le 3 ]; then RESOLVED_TIER="standard"
+      else RESOLVED_TIER="full"
+      fi
+      log "Auto-tier: scope=$scope → tier=$RESOLVED_TIER"
+    fi
+  fi
+
+  case "$RESOLVED_TIER" in
+    nano)
+      case "$phase" in
+        interrogation-review|generate-docs|doc-review|write-specs|holdout-generate|holdout-validate|security-audit) return 1 ;;
+      esac ;;
+    quick)
+      case "$phase" in
+        write-specs|holdout-generate|holdout-validate|security-audit) return 1 ;;
+      esac ;;
+    standard)
+      case "$phase" in
+        holdout-generate|holdout-validate) return 1 ;;
+      esac ;;
+    full) ;;
+  esac
+  return 0
+}
+
 # ============================================================
 # PIPELINE EXECUTION
 # ============================================================
@@ -574,7 +702,17 @@ log "Logs: $LOG_DIR"
 
 if should_run_phase "phase0"; then
   run_phase "phase0" \
-    "You are running the Interrogation Protocol pipeline autonomously. Read CLAUDE.md first, then execute the phase0 context scan: scan git state, check Memory MCP for prior pipeline state, identify project type, TODOs, test status, blockers. Write a phase0-summary.md to ${SUMMARIES_DIR}/. Update Memory MCP with project_type, current_branch, test_status, blocker_count. Output must be under 20 lines." \
+    "You are running the Interrogation Protocol pipeline autonomously. Read CLAUDE.md first, then execute the phase0 context scan: scan git state, check Memory MCP for prior pipeline state, identify project type, TODOs, test status, blockers. Write a phase0-summary.md to ${SUMMARIES_DIR}/. Update Memory MCP with project_type, current_branch, test_status, blocker_count.
+
+After your scan, estimate the scope of the change on a 1-5 scale:
+1 = trivial (typo, config change, <10 lines)
+2 = small (single function/component, <50 lines)
+3 = medium (multiple files, new feature, <200 lines)
+4 = large (cross-cutting, new subsystem, <500 lines)
+5 = massive (architectural change, >500 lines)
+Output SCOPE: N (where N is 1-5) in your response.
+
+Output must be under 20 lines." \
     "$TURNS_PHASE0" "$BUDGET_PHASE0" "--model $MODEL_PHASE0"
 fi
 
@@ -651,23 +789,48 @@ fi
 
 if should_run_phase "generate-docs"; then
   # Detect Agent Teams support for parallel doc generation
-  if claude --version 2>/dev/null | grep -q "agent-teams"; then
+  if "$AGENT_COMMAND" --version 2>/dev/null | grep -q "agent-teams"; then
     run_phase "generate-docs-parallel" \
       "Run /parallel-docs to generate all documentation in parallel using Agent Teams. Read .claude/skills/parallel-docs/SKILL.md for the task breakdown." \
       60 15 "--model $MODEL_GENERATE_DOCS"
   else
     # Fallback: sequential generation (bash backgrounding is unreliable for claude -p)
     # Sequential doc generation: Agent Teams not detected
+    # Determine template selection mode
+    TEMPLATES_INSTRUCTION=""
+    case "${DOC_TEMPLATES_MODE:-auto}" in
+      minimal)
+        TEMPLATES_INSTRUCTION="Generate ONLY these core documents from ${TEMPLATES_DIR}/:
+- PRD.md (required)
+- IMPLEMENTATION_PLAN.md (required)
+- TESTING_PLAN.md (required)
+Skip all other templates." ;;
+      all)
+        TEMPLATES_INSTRUCTION="Generate ALL documents from ${TEMPLATES_DIR}/:
+- PRD.md, APP_FLOW.md, TECH_STACK.md, DATA_MODELS.md
+- API_SPEC.md, FRONTEND_GUIDELINES.md
+- IMPLEMENTATION_PLAN.md, TESTING_PLAN.md
+- SECURITY_CHECKLIST.md, OBSERVABILITY.md, ROLLOUT_PLAN.md" ;;
+      *)  # auto
+        TEMPLATES_INSTRUCTION="Generate documents ADAPTIVELY based on the project type detected in phase0:
+- ALWAYS generate: PRD.md, IMPLEMENTATION_PLAN.md, TESTING_PLAN.md
+- Generate APP_FLOW.md if the project has a user-facing interface
+- Generate API_SPEC.md if the project exposes or consumes APIs
+- Generate DATA_MODELS.md if the project has a data layer or database
+- Generate FRONTEND_GUIDELINES.md only if the project has a frontend
+- Generate TECH_STACK.md if the project uses multiple technologies
+- Generate SECURITY_CHECKLIST.md if the project handles auth, payments, or PII
+- Generate OBSERVABILITY.md if the project is a service or backend
+- Generate ROLLOUT_PLAN.md if the project needs staged deployment
+- SKIP templates that are not relevant to this project type. Do not generate empty or placeholder docs." ;;
+    esac
+
     run_phase "generate-docs" \
       "You are running the Interrogation Protocol pipeline autonomously.
 
-Read CLAUDE.md and CONTRIBUTING_AGENT.md (The Way), then ${SUMMARIES_DIR}/interrogation-summary.md (Tier 2 - do NOT read the full interrogation transcript unless you need specific detail for a section).
+Read CLAUDE.md and CONTRIBUTING_AGENT.md (process rules), then ${SUMMARIES_DIR}/interrogation-summary.md (Tier 2 - do NOT read the full interrogation transcript unless you need specific detail for a section).
 
-Generate all applicable documents from ${TEMPLATES_DIR}/:
-- PRD.md, APP_FLOW.md, TECH_STACK.md, DATA_MODELS.md
-- API_SPEC.md (if API project), FRONTEND_GUIDELINES.md (if frontend)
-- IMPLEMENTATION_PLAN.md, TESTING_PLAN.md
-- SECURITY_CHECKLIST.md, OBSERVABILITY.md, ROLLOUT_PLAN.md
+${TEMPLATES_INSTRUCTION}
 
 BDD REQUIREMENT: Every feature in PRD.md MUST include acceptance criteria in Given/When/Then (Gherkin) format. TESTING_PLAN.md MUST include executable specifications derived from these acceptance criteria.
 
@@ -716,7 +879,27 @@ Always include VERDICT: [PASS|ITERATE] as the last line."
   fi
 fi
 
-# ---- Stage 5b: Auto-Generate Holdouts (Step 16) ----
+# ---- Stage 5b: Write Executable Specifications (Cross-Model BDD) ----
+
+if should_run_phase "write-specs"; then
+  run_phase "write-specs" \
+    "You are a SPECIFICATION WRITER. You will NOT implement any code.
+
+Read CLAUDE.md and CONTRIBUTING_AGENT.md (process rules).
+Read docs/PRD.md, docs/IMPLEMENTATION_PLAN.md, docs/TESTING_PLAN.md.
+
+For each step in IMPLEMENTATION_PLAN.md:
+1. Write executable test specifications (Given/When/Then from PRD acceptance criteria)
+2. Write test files that encode these specifications
+3. Run them to confirm they FAIL (RED phase of BDD)
+4. Commit failing specs: 'test(spec): RED specs for [step]'
+
+You must NOT write any implementation code. Only tests. Only RED.
+Write a summary to ${SUMMARIES_DIR}/write-specs-summary.md listing each spec file and what it tests." \
+    "$TURNS_WRITE_SPECS" "$BUDGET_WRITE_SPECS" "--model $MODEL_WRITE_SPECS"
+fi
+
+# ---- Stage 5c: Auto-Generate Holdouts (Step 16) ----
 # Run between doc review and implementation so holdout scenarios exist
 # before any code is written.
 
@@ -738,7 +921,7 @@ Generate 8-12 adversarial test scenarios that:
 
 Write each to ${HOLDOUTS_DIR}/holdout-NNN-[slug].md using the standard format.
 Start numbering at 001." \
-      "$TURNS_HOLDOUT" "$BUDGET_HOLDOUT" "--model $MODEL_HOLDOUT"
+      "$TURNS_HOLDOUT_GENERATE" "$BUDGET_HOLDOUT_GENERATE" "--model $MODEL_HOLDOUT_GENERATE"
   fi
 fi
 
@@ -746,7 +929,7 @@ fi
 
 if should_run_phase "implement"; then
   # Read implementation steps from the plan
-  raw_result=$(claude -p "Read docs/IMPLEMENTATION_PLAN.md and output ONLY a JSON array of step objects: [{\"id\": \"step-1\", \"title\": \"...\", \"description\": \"...\"}]. Output valid JSON only, no markdown fences." \
+  raw_result=$("$AGENT_COMMAND" -p "Read docs/IMPLEMENTATION_PLAN.md and output ONLY a JSON array of step objects: [{\"id\": \"step-1\", \"title\": \"...\", \"description\": \"...\"}]. Output valid JSON only, no markdown fences." \
     --output-format json --max-turns 5 --max-budget-usd 1 2>/dev/null)
   result_text=$(echo "$raw_result" | jq -r '.result // ""' 2>/dev/null || echo "")
   # Try to extract JSON array - first try direct parse, then regex extraction
@@ -789,6 +972,23 @@ if should_run_phase "implement"; then
 $(cat "${LOG_DIR}/verify-${STEP_ID}-attempt-$((attempt-1)).stderr" 2>/dev/null | head -50)"
       fi
 
+      # Determine BDD mode based on whether write-specs ran
+      SPECS_SUMMARY="${SUMMARIES_DIR}/write-specs-summary.md"
+      if [ -f "$SPECS_SUMMARY" ]; then
+        BDD_PROMPT="Executable specifications (tests) have already been written by a separate agent and are committed.
+Read ${SPECS_SUMMARY} to see what specs exist for this step.
+
+Follow CONTRIBUTING_AGENT.md — GREEN + REFACTOR only:
+1. GREEN: Write only the code required to make the existing failing specs pass. Follow existing codebase patterns. Type everything. Handle all errors.
+2. REFACTOR: Clean up only while all specs remain green.
+Do NOT modify test files unless a spec is demonstrably impossible to satisfy (e.g., tests a non-existent API). If you must change a spec, document why in your commit message."
+      else
+        BDD_PROMPT="Follow CONTRIBUTING_AGENT.md:
+1. RED: Write executable specifications (tests) for this step's behavior FIRST. Run them and confirm they fail.
+2. GREEN: Write only the code required to make the specs pass. Follow existing codebase patterns. Type everything. Handle all errors.
+3. REFACTOR: Clean up only while all specs remain green."
+      fi
+
       # Implement
       run_phase "implement-${STEP_ID}-attempt-${attempt}" \
         "You are implementing step ${STEP_ID}: ${STEP_TITLE}
@@ -800,10 +1000,7 @@ Description: ${STEP_DESC}
 
 ${ERROR_CONTEXT}
 
-Follow The Way (CONTRIBUTING_AGENT.md):
-1. RED: Write executable specifications (tests) for this step's behavior FIRST. Run them and confirm they fail.
-2. GREEN: Write only the code required to make the specs pass. Follow existing codebase patterns. Type everything. Handle all errors.
-3. REFACTOR: Clean up only while all specs remain green.
+${BDD_PROMPT}
 After implementation, run the project's type checker and linter to verify your changes compile.
 Commit your changes with message: 'feat(${STEP_ID}): ${STEP_TITLE}'" \
         "$TURNS_IMPLEMENT" "$BUDGET_IMPLEMENT" "--model $MODEL_IMPLEMENT"
@@ -896,7 +1093,7 @@ If >= 80% and 0 anti-pattern flags: VERDICT: PASS
 If < 80% or any anti-pattern flags: VERDICT: FAIL with details.
 
 Always include VERDICT: [PASS|FAIL] as the last line." \
-      "$TURNS_HOLDOUT" "$BUDGET_HOLDOUT" "--model $MODEL_HOLDOUT"
+      "$TURNS_HOLDOUT_VALIDATE" "$BUDGET_HOLDOUT_VALIDATE" "--model $MODEL_HOLDOUT_VALIDATE"
 
     HOLDOUT_VERDICT=$(jq -r '.result // ""' "${LOG_DIR}/holdout-validate.json" 2>/dev/null | extract_verdict)
     HOLDOUT_VERDICT="${HOLDOUT_VERDICT:-UNKNOWN}"
@@ -989,3 +1186,39 @@ fi
 echo ""
 log "Checkpoint: $CHECKPOINT_FILE"
 log "Full cost log: $COST_LOG"
+
+# ---- Record Pipeline Outcome Metrics ----
+# Append to cumulative metrics file for empirical outcome tracking
+
+METRICS_FILE="${METRICS_FILE:-docs/artifacts/pipeline-metrics.json}"
+mkdir -p "$(dirname "$METRICS_FILE")"
+
+# Count phase verdicts from cost log
+PHASE_COUNT=$(safe_jq "$COST_LOG" '.phases | length' "0")
+RETRY_COUNT=$(safe_jq "$COST_LOG" '[.phases[] | select(.name | test("attempt-[2-9]"))] | length' "0")
+ELAPSED_SECONDS=$(( $(date +%s) - $(date -d "${DATE:0:10} ${DATE:11:2}:${DATE:13:2}" +%s 2>/dev/null || echo "0") ))
+
+# Build this run's metrics entry
+RUN_METRICS=$(cat <<METRICS_EOF
+{
+  "ticket": "${TICKET}",
+  "timestamp": "$(date -Iseconds)",
+  "tier": "${RESOLVED_TIER:-${PIPELINE_TIER:-full}}",
+  "total_cost_usd": ${TOTAL_COST},
+  "phases_run": ${PHASE_COUNT},
+  "retry_count": ${RETRY_COUNT},
+  "status": "completed",
+  "log_dir": "${LOG_DIR}"
+}
+METRICS_EOF
+)
+
+# Append to metrics file (create if missing)
+if [ -f "$METRICS_FILE" ]; then
+  tmp=$(mktemp)
+  jq --argjson run "$RUN_METRICS" '.runs += [$run] | .total_runs += 1 | .total_cost_usd += $run.total_cost_usd' \
+    "$METRICS_FILE" > "$tmp" 2>/dev/null && mv "$tmp" "$METRICS_FILE" || rm -f "$tmp"
+else
+  echo "{\"runs\":[${RUN_METRICS}],\"total_runs\":1,\"total_cost_usd\":${TOTAL_COST}}" | jq '.' > "$METRICS_FILE" 2>/dev/null || true
+fi
+log "Metrics appended to: $METRICS_FILE"

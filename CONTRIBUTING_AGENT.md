@@ -1,18 +1,17 @@
-# THE WAY
+# Development Process
 
-This repository is governed by The Way.
-The Way is not a suggestion. It is the prescribed order of creation.
+This repository is governed by a strict development process.
+The process is not a suggestion. It is the prescribed order of creation.
 All work must pass through its forms.
-This is The Way.
 
-Deviation from The Way offends the discipline that makes autonomous pipelines reliable. Shortcuts produce hallucinations, wasted cost, and broken gates. Every sin against The Way is a pipeline that ships bugs.
+Deviation from this process undermines the discipline that makes autonomous pipelines reliable. Shortcuts produce hallucinations, wasted cost, and broken gates. Every violation ships bugs.
 
-## The Sacrament of Specification
+## Specification Protocol
 
 The pipeline is the instrument of record. Nothing exists until it is interrogated, documented, and gated.
 
 Work begins in interrogation, not in code.
-Code without documentation is disorder.
+Code without documentation is unverifiable.
 
 Every change must be:
 - Interrogated.
@@ -23,7 +22,7 @@ Every change must be:
 
 If it did not pass the gates, it did not happen.
 
-## The Single Source of Truth
+## Single Source of Truth
 
 `pipeline.config.sh` is the one configuration. All thresholds, timeouts, models, budgets, and paths live there. Consumers read from it. Nothing is hardcoded in runners or prompts when a config variable exists.
 
@@ -35,9 +34,10 @@ Direct manipulation of magic numbers is strictly forbidden:
 
 When you add a new tunable value:
 1. Add it to `pipeline.config.sh` with a comment
-2. Add it to the numeric validation guard if numeric
-3. Add it to the `CONFIG_VARS` array in `scripts/test-anvil.sh`
+2. Numeric validation and guard loops auto-discover from `pipeline.config.sh` — no manual update needed
+3. Test suite auto-discovers config vars — no manual update needed
 4. Use it in consumers via `${VAR_NAME}` (bash) or `_config.get("VAR_NAME", default)` (Python)
+5. For string configs, use naming convention `*_DIR`, `*_FILE`, `*_ORDER`, or `*_COMMAND` to skip numeric validation
 
 ## Running the Pipeline (Do This Exactly)
 
@@ -69,18 +69,35 @@ claude
 # then: /feature-add "description"
 ```
 
-## The Order of Phases
+## Phase Order
 
 All work is structured.
 
 The pipeline flows through phases in strict order:
-`phase0` -> `interrogate` -> `interrogation-review` -> `generate-docs` -> `doc-review` -> `holdout-generate` -> `implement` -> `holdout-validate` -> `security-audit` -> `ship`
+`phase0` -> `interrogate` -> `interrogation-review` -> `generate-docs` -> `doc-review` -> `write-specs` -> `holdout-generate` -> `implement` -> `holdout-validate` -> `security-audit` -> `ship`
 
 Phase ordering is defined in `PHASE_ORDER` in `pipeline.config.sh`. It is not to be altered without updating all consumers.
 
-Structure is not bureaucracy. Structure is memory.
+**Pipeline Tiers** control which phases run, balancing cost against rigor:
+- **full** (~$40-50, 30+ min): All phases. For large or critical changes.
+- **standard** (~$20-30, 15-20 min): Skips holdouts, single-pass reviews. For medium changes.
+- **quick** (~$8-15, 5-10 min): Single-pass reviews, skips holdouts, security, write-specs. For small changes.
+- **nano** (~$3-5, 2-3 min): Interrogate + implement + verify + ship only. For trivial changes (typos, config).
+- **auto** (default): Phase 0 estimates scope (1-5) and selects the appropriate tier.
 
-## The Cognitive Framework
+Set `PIPELINE_TIER` in `pipeline.config.sh` or let auto-detection handle it. All tiers include review gates — quick uses single-pass reviews, full uses dual-pass with bias mitigation.
+
+**Human Gates** allow optional human checkpoints at any phase. Set `HUMAN_GATES="write-specs,doc-review"` in config to pause the pipeline for human approval before those phases proceed. The pipeline exits with code 2 and resumes with `--resume` after the human creates a `.human-approved` marker file.
+
+**External Review Validators** break the same-family limitation. Set `REVIEW_VALIDATOR_COMMAND` to pipe review output to a non-Anthropic model, static analyzer, or human review script for an independent 3rd verdict. The strictest verdict across all passes wins.
+
+**Adaptive Template Selection** (`DOC_TEMPLATES_MODE`) avoids generating documents nobody will read. In `auto` mode, only templates relevant to the detected project type are generated. A CLI tool skips FRONTEND_GUIDELINES.md. A service without a database skips DATA_MODELS.md. Set to `minimal` for just PRD + implementation plan + testing plan.
+
+**Outcome Metrics** are recorded to `METRICS_FILE` after every run. The cumulative metrics track cost, tier, phases run, retry counts, and status across all pipeline runs. Use `scripts/benchmark.sh` for controlled A/B comparison between Anvil and single-prompt approaches.
+
+Structure is not bureaucracy. Structure prevents context loss.
+
+## Development Framework
 
 There is one discipline.
 
@@ -90,8 +107,6 @@ The specification is the product.
 Documentation defines the behavior contract.
 Implementation code exists only to make failing specifications pass.
 Holdout scenarios exist to catch what the spec forgot.
-
-This is the first principle.
 
 Non-negotiable laws:
 - Begin with intent, not internals.
@@ -108,9 +123,11 @@ Non-negotiable laws:
 If behavior cannot be observed, it is not behavior.
 If a requirement cannot be verified, it is not a requirement.
 
-## The Rite of Specification
+## Specification Discipline
 
 Every feature must have executable specifications before implementation begins.
+
+**Cross-Model BDD (Pipeline Mode):** In autonomous pipeline mode, a separate model (Sonnet) writes the failing specifications (RED phase) in the `write-specs` stage. The implementing model (Opus) then writes only the code to make those specs pass (GREEN phase) and refactors while specs remain green. This eliminates the same-brain problem — the model writing the spec has different reasoning patterns than the model satisfying it. When `write-specs` is skipped (e.g., quick tier), the implementing model performs all three phases (RED/GREEN/REFACTOR) as a single agent.
 
 When the target project supports a test framework, specifications take the form of Gherkin features:
 
@@ -131,9 +148,7 @@ The form may vary. The discipline does not.
 
 100% specification coverage is mandatory. Every behavior must be specified. Every specification must pass.
 
-Green is peace. Red is unfinished.
-
-## The Interrogation Ritual
+## Interrogation Protocol
 
 When asked to build or change behavior, follow this sequence. It is not optional.
 
@@ -142,15 +157,15 @@ When asked to build or change behavior, follow this sequence. It is not optional
 3. **Review the interrogation.** LLM-as-Judge with position bias mitigation (dual-pass, cross-model). Score each section. Gate: `>= THRESHOLD_PASS` to proceed.
 4. **Generate documentation.** Fill all applicable templates from `${TEMPLATES_DIR}/`. One at a time. Write output, release from context. Every feature in the PRD must have acceptance criteria in Given/When/Then form.
 5. **Review the documentation.** LLM-as-Judge again. Gate: `>= THRESHOLD_DOC_REVIEW` to proceed.
-6. **Write executable specifications.** Translate acceptance criteria into the project's test framework (Gherkin features, test cases, or equivalent). Run them and confirm they fail. This is the red phase.
-7. **Generate holdout scenarios.** Adversarial tests written in complete isolation from the implementation agent. Written to `${HOLDOUTS_DIR}/`. These are the hidden specifications.
+6. **Write executable specifications (cross-model BDD).** A separate model (Sonnet) translates acceptance criteria into the project's test framework (Gherkin features, test cases, or equivalent). It runs them and confirms they fail. This is the red phase. The implementing model (Opus) never writes these specs — separation of concerns eliminates same-brain bias.
+7. **Generate holdout scenarios (cross-model).** Adversarial tests generated by one model (Opus) and validated by another (Sonnet), written in complete isolation from the implementation agent. Written to `${HOLDOUTS_DIR}/`. These are the hidden specifications.
 8. **Implement.** Step by step from `IMPLEMENTATION_PLAN.md`. Write only the code required to make the specifications pass. This is the green phase. Verify each step. Retry up to `MAX_VERIFY_RETRIES`. Commit after each verified step.
 9. **Refactor.** Only while all specifications remain green.
 10. **Holdout validation.** Run implementation against the hidden scenarios. Gate: `>= THRESHOLD_HOLDOUT` and zero anti-pattern flags.
 11. **Security audit.** Scan for OWASP top 10, hardcoded secrets, insecure defaults. Gate: zero BLOCKERs.
 12. **Ship.** Final test suite, PR creation, recording.
 
-Skipping steps is corruption of the process.
+Skipping steps breaks the process.
 
 ## Roles in the Order
 
@@ -172,7 +187,7 @@ Skipping steps is corruption of the process.
 
 **Ship** records the outcome and publishes it for review.
 
-## The Rite of Holdout
+## Holdout Protocol
 
 Every pipeline must generate holdout scenarios before implementation begins.
 
@@ -187,11 +202,11 @@ The implementing agent never sees the holdouts.
 The holdout validator never sees the implementation prompts.
 This separation is required.
 
-Without holdouts, there is no alignment between intent and implementation.
+Without holdouts, there is no independent verification of intent vs. implementation.
 
 ## Gate Discipline
 
-Gates are the checkpoints of The Way. They are not optional.
+Gates are the checkpoints of the process. They are not optional.
 
 | Gate | Threshold | Failure Action |
 |------|-----------|----------------|
@@ -219,7 +234,7 @@ The pipeline protects itself from runaway cost and infinite loops.
 - **Stagnation detection:** `>= STAGNATION_SIMILARITY_THRESHOLD`% similar errors across retries triggers reroute.
 - **Progress tracking:** `MAX_NO_PROGRESS` consecutive implementation phases without git commits = stall.
 
-Circuit breakers are not paranoia. They are discipline.
+Circuit breakers prevent runaway cost and infinite retry loops.
 
 ## Context Discipline
 
@@ -277,7 +292,7 @@ It validates:
 - Security (no hardcoded secrets)
 - Doc template cross-references
 
-If the test suite fails, The Way has been broken. Fix it before committing.
+If the test suite fails, the process has been broken. Fix it before committing.
 
 ## Commit Discipline
 
@@ -288,7 +303,7 @@ If the test suite fails, The Way has been broken. Fix it before committing.
 
 ## The Routing Graph
 
-`pipeline.graph.dot` defines the flow of phases and gates. It is the map of The Way.
+`pipeline.graph.dot` defines the flow of phases and gates. It is the authoritative routing map.
 
 Edge labels reference config variable names, not literal numbers. When thresholds change in `pipeline.config.sh`, the graph remains accurate without edits.
 
@@ -296,7 +311,7 @@ The graph is authoritative. `route_from_gate()` in both runners must implement e
 
 ## Example: Adding a Feature
 
-Even the smallest feature must pass through The Way.
+Even the smallest feature must pass through the process.
 
 No code precedes specification.
 No specification precedes documentation.
@@ -332,4 +347,4 @@ User request: "Add a logout button."
 11. Security audit: Does logout actually clear tokens? Are there dangling sessions?
 12. Ship.
 
-This is The Way.
+This is the process.

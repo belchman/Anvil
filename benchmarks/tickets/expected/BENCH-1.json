@@ -1,0 +1,34 @@
+{
+  "ticket": "BENCH-1",
+  "description": "Fix off-by-one bug in complete()",
+  "checks": [
+    {
+      "type": "ast_parse",
+      "file": "tasktrack/store.py",
+      "weight": 10
+    },
+    {
+      "type": "grep_absent",
+      "file": "tasktrack/store.py",
+      "pattern": "int\\(task_id\\)\\s*-\\s*1",
+      "description": "Index-based access removed",
+      "weight": 30
+    },
+    {
+      "type": "grep_present",
+      "file": "tasktrack/store.py",
+      "pattern": "self\\._tasks\\[",
+      "description": "Dict key lookup used",
+      "weight": 20
+    },
+    {
+      "type": "pytest",
+      "weight": 30
+    },
+    {
+      "type": "test_count_minimum",
+      "minimum": 6,
+      "weight": 10
+    }
+  ]
+}

@@ -17,6 +17,9 @@ docs/artifacts/prescriptions/
 .DS_Store
 Thumbs.db
 
+# Benchmark temp directories
+docs/artifacts/benchmark-*/
+
 # Python
 __pycache__/
 *.pyc
