@@ -35,19 +35,26 @@ from claude_agent_sdk import (
 # --- Configuration ---
 
 # Fallback defaults — overridden by pipeline.config.sh in main()
-MODELS = {
-    "phase0": "claude-sonnet-4-5-20250929",
-    "interrogate": "claude-opus-4-6",
-    "review": "claude-sonnet-4-5-20250929",
-    "generate_docs": "claude-opus-4-6",
-    "implement": "claude-opus-4-6",
-    "verify": "claude-sonnet-4-5-20250929",
-    "security": "claude-sonnet-4-5-20250929",
-    "holdout_generate": "claude-opus-4-6",
-    "holdout_validate": "claude-sonnet-4-5-20250929",
-    "write_specs": "claude-sonnet-4-5-20250929",
-    "ship": "claude-sonnet-4-5-20250929",
-}
+def _load_models() -> dict:
+    """Load model assignments from pipeline.models.json."""
+    models_file = Path(__file__).parent / "pipeline.models.json"
+    defaults = {
+        "phase0": "routing", "interrogate": "generation", "review": "review",
+        "generate_docs": "generation", "implement": "implementation",
+        "verify": "review", "security": "security",
+        "holdout_generate": "holdout_generate", "holdout_validate": "holdout_validate",
+        "write_specs": "specification", "ship": "review",
+    }
+    fallback_model = "claude-opus-4-6"
+    if models_file.exists():
+        import json
+        data = json.loads(models_file.read_text())
+        fallback_model = data.get("default", fallback_model)
+        overrides = data.get("overrides", {})
+        return {phase: overrides.get(key, fallback_model) for phase, key in defaults.items()}
+    return {phase: fallback_model for phase in defaults}
+
+MODELS = _load_models()
 
 # Fallback defaults — overridden by pipeline.config.sh in main()
 MAX_VERIFY_RETRIES = 3
@@ -267,7 +274,7 @@ class PipelineState:
                 if scope <= 1:
                     self.resolved_tier = "nano"
                 elif scope <= 2:
-                    self.resolved_tier = "quick"
+                    self.resolved_tier = "lite"
                 elif scope <= 3:
                     self.resolved_tier = "standard"
                 else:
@@ -275,8 +282,10 @@ class PipelineState:
                 print(f"  Auto-tier: scope={scope} -> tier={self.resolved_tier}")
 
         skip_phases: dict[str, set[str]] = {
-            "nano": {"interrogation-review", "generate-docs", "doc-review", "write-specs", "holdout-generate", "holdout-validate", "security-audit"},
+            "guard": {"interrogate", "interrogation-review", "generate-docs", "doc-review", "write-specs", "holdout-generate", "holdout-validate"},
+            "nano": {"interrogate", "interrogation-review", "generate-docs", "doc-review", "write-specs", "holdout-generate", "holdout-validate", "security-audit"},
             "quick": {"write-specs", "holdout-generate", "holdout-validate", "security-audit"},
+            "lite": {"generate-docs", "doc-review", "interrogation-review", "security-audit"},
             "standard": {"holdout-generate", "holdout-validate"},
         }
         return phase not in skip_phases.get(self.resolved_tier, set())
@@ -809,26 +818,37 @@ async def main():
     global MODELS, MAX_VERIFY_RETRIES, MAX_INTERROGATION_ITERATIONS
     global STAGNATION_SIMILARITY_THRESHOLD, PHASE_ORDER, _config
 
-    ticket = sys.argv[1] if len(sys.argv) > 1 else "NO-TICKET"
+    # Parse arguments: TICKET-ID [--tier TIER] [--resume LOG_DIR]
+    args = sys.argv[1:]
+    ticket = "NO-TICKET"
+    tier_override = None
+    resume_dir_arg = None
+
+    i = 0
+    while i < len(args):
+        if args[i] == "--tier" and i + 1 < len(args):
+            tier_override = args[i + 1]
+            i += 2
+        elif args[i] == "--resume" and i + 1 < len(args):
+            resume_dir_arg = args[i + 1]
+            i += 2
+        elif not args[i].startswith("--"):
+            ticket = args[i]
+            i += 1
+        else:
+            print(f"[ERROR] Unknown option: {args[i]}")
+            sys.exit(1)
 
     # --- Feature 5: Load config from pipeline.config.sh ---
     config_path = Path(__file__).parent / "pipeline.config.sh"
     _config = load_bash_config(config_path)
 
-    # Override hardcoded defaults with config values
-    MODELS = {
-        "phase0": _config.get("MODEL_PHASE0", MODELS["phase0"]),
-        "interrogate": _config.get("MODEL_INTERROGATE", MODELS["interrogate"]),
-        "review": _config.get("MODEL_REVIEW", MODELS["review"]),
-        "generate_docs": _config.get("MODEL_GENERATE_DOCS", MODELS["generate_docs"]),
-        "implement": _config.get("MODEL_IMPLEMENT", MODELS["implement"]),
-        "verify": _config.get("MODEL_VERIFY", MODELS["verify"]),
-        "security": _config.get("MODEL_SECURITY", MODELS["security"]),
-        "holdout_generate": _config.get("MODEL_HOLDOUT_GENERATE", MODELS["holdout_generate"]),
-        "holdout_validate": _config.get("MODEL_HOLDOUT_VALIDATE", MODELS["holdout_validate"]),
-        "write_specs": _config.get("MODEL_WRITE_SPECS", MODELS["write_specs"]),
-        "ship": _config.get("MODEL_SHIP", MODELS["ship"]),
-    }
+    # Apply --tier override
+    if tier_override:
+        _config["PIPELINE_TIER"] = tier_override
+        os.environ["PIPELINE_TIER"] = tier_override
+
+    # Models are loaded from pipeline.models.json by _load_models() at import time
     MAX_VERIFY_RETRIES = get_config_int(_config, "MAX_VERIFY_RETRIES", 3)
     MAX_INTERROGATION_ITERATIONS = get_config_int(_config, "MAX_INTERROGATION_ITERATIONS", 2)
     STAGNATION_SIMILARITY_THRESHOLD = get_config_float(_config, "STAGNATION_SIMILARITY_THRESHOLD", 90) / 100.0
@@ -843,8 +863,8 @@ async def main():
     )
 
     # --- Feature 3: Resume from checkpoint ---
-    if len(sys.argv) > 2 and sys.argv[2] == "--resume" and len(sys.argv) > 3:
-        resume_dir = Path(sys.argv[3])
+    if resume_dir_arg:
+        resume_dir = Path(resume_dir_arg)
         if (resume_dir / "checkpoint.json").exists():
             checkpoint = json.loads((resume_dir / "checkpoint.json").read_text())
             state.resume_phase = checkpoint.get("current_phase", "phase0")

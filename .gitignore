@@ -19,6 +19,7 @@ Thumbs.db
 
 # Benchmark temp directories
 docs/artifacts/benchmark-*/
+docs/artifacts/variance-*/
 
 # Python
 __pycache__/
@@ -26,6 +27,7 @@ __pycache__/
 *.pyo
 .venv/
 venv/
+.pytest_cache/
 
 # Node
 node_modules/

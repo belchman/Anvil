@@ -1,0 +1,40 @@
+{
+  "ticket": "BENCH-7",
+  "description": "Add rollback to order processing",
+  "checks": [
+    {
+      "type": "ast_parse",
+      "file": "invtrack/orders.py",
+      "weight": 5
+    },
+    {
+      "type": "grep_present",
+      "file": "invtrack/orders.py",
+      "pattern": "(decremented_items|_to_rollback|items_adjusted|rollback_list|completed_decrements|already_decremented)",
+      "description": "Rollback tracking variable in place_order()",
+      "weight": 20
+    },
+    {
+      "type": "grep_present",
+      "file": "invtrack/orders.py",
+      "pattern": "(try|except|finally)",
+      "description": "Error handling for rollback",
+      "weight": 10
+    },
+    {
+      "type": "pytest",
+      "weight": 35
+    },
+    {
+      "type": "pytest_subset",
+      "pattern": "rollback or partial or atomic",
+      "description": "Rollback-specific tests pass",
+      "weight": 15
+    },
+    {
+      "type": "test_count_increased",
+      "baseline": 11,
+      "weight": 15
+    }
+  ]
+}

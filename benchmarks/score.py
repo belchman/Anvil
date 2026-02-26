@@ -99,6 +99,52 @@ def check_test_count_increased(workdir, check):
     return {"pass": passed, "detail": f"Test count: {count} (baseline: {baseline})"}
 
 
+def check_grep_absent_all(workdir, check):
+    """Verify regex pattern is absent from ALL files matching a glob pattern."""
+    import glob as glob_mod
+
+    pattern = check["pattern"]
+    file_glob = check.get("glob", "**/*.py")
+    desc = check.get("description", f"Pattern absent from {file_glob}")
+
+    found_in = []
+    for filepath in glob_mod.glob(os.path.join(workdir, file_glob), recursive=True):
+        if not os.path.isfile(filepath):
+            continue
+        with open(filepath) as f:
+            content = f.read()
+        if re.search(pattern, content):
+            found_in.append(os.path.relpath(filepath, workdir))
+
+    if found_in:
+        return {"pass": False, "detail": f"Pattern still present in: {', '.join(found_in)}"}
+    return {"pass": True, "detail": f"Pattern absent: {desc}"}
+
+
+def check_file_exists(workdir, check):
+    """Verify a file was created."""
+    filepath = os.path.join(workdir, check["file"])
+    desc = check.get("description", check["file"])
+    if os.path.exists(filepath):
+        return {"pass": True, "detail": f"File exists: {desc}"}
+    return {"pass": False, "detail": f"File not found: {desc}"}
+
+
+def check_pytest_count_files(workdir, check):
+    """Count test files (not just test functions)."""
+    minimum = check.get("minimum", 1)
+    tests_dir = os.path.join(workdir, "tests")
+    count = 0
+    if os.path.isdir(tests_dir):
+        for root, _, files in os.walk(tests_dir):
+            for fname in files:
+                if fname.startswith("test_") and fname.endswith(".py"):
+                    count += 1
+    passed = count >= minimum
+    desc = check.get("description", f"At least {minimum} test files")
+    return {"pass": passed, "detail": f"Test files: {count} (minimum: {minimum}) - {desc}"}
+
+
 def check_file_unchanged(workdir, check):
     """Verify file SHA-256 matches baseline."""
     filepath = os.path.join(workdir, check["file"])
@@ -146,8 +192,12 @@ CHECK_DISPATCH = {
     "pytest_subset": check_pytest,
     "grep_present": check_grep_present,
     "grep_absent": check_grep_absent,
+    "grep_absent_all": check_grep_absent_all,
+    "file_exists": check_file_exists,
     "test_count_minimum": check_test_count_minimum,
     "test_count_increased": check_test_count_increased,
+    "test_count_files": check_pytest_count_files,
+    "pytest_count_files": check_pytest_count_files,
     "file_unchanged": check_file_unchanged,
 }
 

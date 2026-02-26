@@ -1,0 +1,38 @@
+{
+  "ticket": "BENCH-8",
+  "description": "Fix pagination off-by-one bug",
+  "checks": [
+    {
+      "type": "ast_parse",
+      "file": "invtrack/cli.py",
+      "weight": 5
+    },
+    {
+      "type": "ast_parse",
+      "file": "invtrack/store.py",
+      "weight": 5
+    },
+    {
+      "type": "grep_present",
+      "file": "invtrack/cli.py",
+      "pattern": "(args\\.page\\s*-\\s*1|page\\s*=\\s*args\\.page\\s*-\\s*1|page_index\\s*=)",
+      "description": "Page index conversion in CLI (1-indexed to 0-indexed)",
+      "weight": 25
+    },
+    {
+      "type": "pytest",
+      "weight": 35
+    },
+    {
+      "type": "pytest_subset",
+      "pattern": "pagination or page",
+      "description": "Pagination-specific tests pass",
+      "weight": 15
+    },
+    {
+      "type": "test_count_increased",
+      "baseline": 11,
+      "weight": 15
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+[project]
+name = "invtrack"
+version = "0.1.0"
+description = "Inventory tracking system with JSON persistence"
+requires-python = ">=3.11"
+
+[project.scripts]
+invtrack = "invtrack.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

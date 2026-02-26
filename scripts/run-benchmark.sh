@@ -24,7 +24,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 BENCHMARK_DIR="${ROOT}/benchmarks"
-TARGET_DIR="${BENCHMARK_DIR}/target"
+TARGET_DIR=""  # resolved after arg parsing
 TICKETS_DIR="${BENCHMARK_DIR}/tickets"
 SCORER="${BENCHMARK_DIR}/score.py"
 BENCHMARK_CONFIG="${BENCHMARK_DIR}/benchmark.config.sh"
@@ -38,6 +38,8 @@ APPROACH="both"
 MAX_BUDGET=15
 OUTPUT_DIR=""
 DRY_RUN=false
+TARGET_NAME="target"
+ANVIL_TIER="lite"
 
 # Colors (disabled when not a terminal)
 if [ -t 1 ]; then
@@ -58,6 +60,9 @@ usage() {
   echo "Options:"
   echo "  --ticket BENCH-N     Run single ticket (default: all BENCH-*.md)"
   echo "  --approach TYPE      anvil|freestyle|both (default: both)"
+  echo "  --target NAME        Target project directory name (default: target)"
+  echo "  --target-hard        Shortcut for --target target-hard"
+  echo "  --tier TIER          Pipeline tier for Anvil runs (default: lite)"
   echo "  --max-budget USD     Per-ticket budget cap (default: 15)"
   echo "  --output DIR         Output directory"
   echo "  --dry-run            Show plan without executing"
@@ -72,11 +77,17 @@ while [[ $# -gt 0 ]]; do
     --approach)   APPROACH="$2"; shift 2 ;;
     --max-budget) MAX_BUDGET="$2"; shift 2 ;;
     --output)     OUTPUT_DIR="$2"; shift 2 ;;
+    --target)     TARGET_NAME="$2"; shift 2 ;;
+    --target-hard) TARGET_NAME="target-hard"; shift ;;
+    --tier)       ANVIL_TIER="$2"; shift 2 ;;
     --dry-run)    DRY_RUN=true; shift ;;
     -h|--help)    usage ;;
     *) err "Unknown option: $1"; usage ;;
   esac
 done
+
+# ---- Resolve Target Directory ----
+TARGET_DIR="${BENCHMARK_DIR}/${TARGET_NAME}"
 
 # ---- Pre-flight Checks ----
 if [ ! -d "$TARGET_DIR" ]; then
@@ -159,6 +170,7 @@ fi
 mkdir -p "$OUTPUT_DIR"
 
 log "Benchmark configuration:"
+log "  Target:   ${TARGET_NAME}"
 log "  Tickets:  ${TICKETS[*]}"
 log "  Approach: $APPROACH"
 log "  Budget:   \$${MAX_BUDGET}/ticket"
@@ -180,8 +192,8 @@ BASELINE_HASHES_FILE="${OUTPUT_DIR}/baseline-hashes.json"
   cd "$TARGET_DIR"
   echo "{"
   first=true
-  for f in tasktrack/*.py tests/*.py; do
-    [ -f "$f" ] || continue
+  # Auto-discover Python source and test files
+  find . -name '*.py' -not -path './.pytest_cache/*' -not -path './__pycache__/*' | sort | while read -r f; do
     hash=$(shasum -a 256 "$f" | cut -d' ' -f1)
     if [ "$first" = true ]; then first=false; else echo ","; fi
     printf '  "%s": "%s"' "$f" "$hash"
@@ -202,6 +214,7 @@ EVIDENCE_FILE="${OUTPUT_DIR}/benchmark-evidence.json"
 cat > "$EVIDENCE_FILE" << EOF
 {
   "started": "$(date -Iseconds)",
+  "target": "${TARGET_NAME}",
   "baseline_tests": ${BASELINE_TEST_COUNT},
   "approach": "${APPROACH}",
   "tickets": [],
@@ -249,8 +262,10 @@ run_anvil() {
   cp -r "${ROOT}/.claude" "${workdir}/" 2>/dev/null || true
   cp "${ROOT}/run-pipeline.sh" "${workdir}/" 2>/dev/null || true
   cp "${ROOT}/pipeline.config.sh" "${workdir}/" 2>/dev/null || true
-  cp "${ROOT}/pipeline.graph.dot" "${workdir}/" 2>/dev/null || true
   cp "${ROOT}/pipeline.models.json" "${workdir}/" 2>/dev/null || true
+  cp "${ROOT}/CONTRIBUTING_AGENT.md" "${workdir}/" 2>/dev/null || true
+  mkdir -p "${workdir}/scripts"
+  cp "${ROOT}/scripts/review-validator.sh" "${workdir}/scripts/" 2>/dev/null || true
   chmod +x "${workdir}/run-pipeline.sh" 2>/dev/null || true
 
   # Apply benchmark config overrides (append to pipeline.config.sh)
@@ -278,7 +293,7 @@ run_anvil() {
   start_time=$(date +%s)
 
   set +e
-  (cd "$workdir" && unset CLAUDECODE && PIPELINE_TIER="nano" run_with_timeout 600 ./run-pipeline.sh \
+  (cd "$workdir" && unset CLAUDECODE && PIPELINE_TIER="$ANVIL_TIER" run_with_timeout 1800 ./run-pipeline.sh \
     "${ticket_id}: ${ticket_text}" > "$log_file" 2>&1)
   exit_code=$?
   set -e
@@ -335,6 +350,7 @@ Read the codebase, write tests first, implement, verify all tests pass." \
     --max-turns 40 \
     --max-budget-usd "$MAX_BUDGET" \
     --permission-mode bypassPermissions \
+    --output-format json \
     > "$log_file" 2>&1)
   exit_code=$?
   set -e
@@ -343,10 +359,15 @@ Read the codebase, write tests first, implement, verify all tests pass." \
   end_time=$(date +%s)
   elapsed=$(( end_time - start_time ))
 
-  # Try to extract cost from claude output
+  # Extract cost from JSON output (--output-format json)
   local cost
-  cost=$(grep -o 'cost: \$[0-9.]*' "$log_file" 2>/dev/null | grep -o '[0-9.]*' | tail -1 || echo "0")
+  cost=$(jq -r '.total_cost_usd // 0' "$log_file" 2>/dev/null || echo "0")
   [ -z "$cost" ] && cost="0"
+  # Fallback: try regex if jq fails (non-JSON output)
+  if [ "$cost" = "0" ] || [ "$cost" = "null" ]; then
+    cost=$(grep -o 'cost: \$[0-9.]*' "$log_file" 2>/dev/null | grep -o '[0-9.]*' | tail -1 || echo "0")
+    [ -z "$cost" ] && cost="0"
+  fi
 
   # Score the result
   local score_output="${OUTPUT_DIR}/freestyle-${ticket_id}-score.json"
@@ -394,17 +415,26 @@ FREE_COST=$(jq '[.tickets[] | select(.approach=="freestyle") | .cost_usd] | add 
 ANVIL_TIME=$(jq '[.tickets[] | select(.approach=="anvil") | .elapsed_s] | add // 0' "$EVIDENCE_FILE")
 FREE_TIME=$(jq '[.tickets[] | select(.approach=="freestyle") | .elapsed_s] | add // 0' "$EVIDENCE_FILE")
 
+# Add per-ticket cost_per_point to evidence
+update_evidence \
+  'def cpp: if .score > 0 then (.cost_usd / .score * 100) else 0 end;
+   .tickets = [.tickets[] | . + {"cost_per_point": (. | cpp)}]'
+
 update_evidence \
   --argjson anvil_avg "$ANVIL_SCORES" --argjson free_avg "$FREE_SCORES" \
   --argjson anvil_cost "$ANVIL_COST" --argjson free_cost "$FREE_COST" \
   --argjson anvil_time "$ANVIL_TIME" --argjson free_time "$FREE_TIME" \
+  --arg target "$TARGET_NAME" \
   '.summary = {
+    "target": $target,
     "anvil_avg_score": $anvil_avg,
     "freestyle_avg_score": $free_avg,
     "anvil_total_cost": $anvil_cost,
     "freestyle_total_cost": $free_cost,
     "anvil_total_time_s": $anvil_time,
     "freestyle_total_time_s": $free_time,
+    "anvil_cost_per_point": (if $anvil_avg > 0 then ($anvil_cost / $anvil_avg * 100) else 0 end),
+    "freestyle_cost_per_point": (if $free_avg > 0 then ($free_cost / $free_avg * 100) else 0 end),
     "completed": now | todate
   }'
 

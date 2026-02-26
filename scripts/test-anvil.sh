@@ -47,15 +47,13 @@ CORE_FILES=(
   "run-pipeline.sh"
   "run_pipeline.py"
   "pipeline.config.sh"
-  "pipeline.graph.dot"
   "pipeline.models.json"
   ".env.example"
   ".gitignore"
   "scripts/agent-test.sh"
-  "scripts/benchmark.sh"
   "scripts/run-benchmark.sh"
   "scripts/review-validator.sh"
-  "scripts/self-validate.sh"
+  "scripts/setup-anvil.sh"
   ".github/workflows/autonomous-pipeline.yml"
   "benchmarks/score.py"
   "benchmarks/benchmark.config.sh"
@@ -65,6 +63,19 @@ CORE_FILES=(
   "benchmarks/target/tests/test_store.py"
   "benchmarks/target/CLAUDE.md"
   "benchmarks/target/pyproject.toml"
+  "benchmarks/target-hard/invtrack/__init__.py"
+  "benchmarks/target-hard/invtrack/models.py"
+  "benchmarks/target-hard/invtrack/store.py"
+  "benchmarks/target-hard/invtrack/inventory.py"
+  "benchmarks/target-hard/invtrack/orders.py"
+  "benchmarks/target-hard/invtrack/reports.py"
+  "benchmarks/target-hard/invtrack/cli.py"
+  "benchmarks/target-hard/tests/test_store.py"
+  "benchmarks/target-hard/tests/test_inventory.py"
+  "benchmarks/target-hard/tests/test_orders.py"
+  "benchmarks/target-hard/CLAUDE.md"
+  "benchmarks/target-hard/pyproject.toml"
+  "scripts/setup-anvil.sh"
 )
 for f in "${CORE_FILES[@]}"; do
   if [ -f "$ROOT/$f" ]; then
@@ -75,7 +86,7 @@ for f in "${CORE_FILES[@]}"; do
 done
 
 # Skills (11 expected)
-SKILLS=(phase0 interrogate feature-add cost-report parallel-docs satisfaction-score generate-dtu update-progress error-analysis heal oracle-verify)
+SKILLS=(phase0 interrogate feature-add cost-report update-progress error-analysis heal)
 for s in "${SKILLS[@]}"; do
   if [ -f "$ROOT/.claude/skills/$s/SKILL.md" ]; then
     pass "skill: $s"
@@ -95,7 +106,7 @@ for a in "${AGENTS[@]}"; do
 done
 
 # Rules (4 expected)
-RULES=(no-assumptions context-fidelity compaction context-budget)
+RULES=(no-assumptions context-management)
 for r in "${RULES[@]}"; do
   if [ -f "$ROOT/.claude/rules/$r.md" ]; then
     pass "rule: $r"
@@ -124,8 +135,8 @@ else
   fail ".claude/settings.json missing"
 fi
 
-# Benchmark tickets (5 expected)
-BENCH_TICKETS=(BENCH-1 BENCH-2 BENCH-3 BENCH-4 BENCH-5)
+# Benchmark tickets (10 expected: 5 simple + 5 hard)
+BENCH_TICKETS=(BENCH-1 BENCH-2 BENCH-3 BENCH-4 BENCH-5 BENCH-6 BENCH-7 BENCH-8 BENCH-9 BENCH-10)
 for bt in "${BENCH_TICKETS[@]}"; do
   if [ -f "$ROOT/benchmarks/tickets/${bt}.md" ]; then
     pass "ticket: ${bt}.md"
@@ -151,7 +162,7 @@ fi
 # ============================================================
 section "Bash Syntax"
 
-for script in "$ROOT/run-pipeline.sh" "$ROOT/pipeline.config.sh" "$ROOT/scripts/agent-test.sh" "$ROOT/scripts/benchmark.sh" "$ROOT/scripts/run-benchmark.sh" "$ROOT/scripts/review-validator.sh" "$ROOT/scripts/self-validate.sh" "$ROOT/benchmarks/benchmark.config.sh"; do
+for script in "$ROOT/run-pipeline.sh" "$ROOT/pipeline.config.sh" "$ROOT/scripts/agent-test.sh" "$ROOT/scripts/run-benchmark.sh" "$ROOT/scripts/review-validator.sh" "$ROOT/scripts/setup-anvil.sh" "$ROOT/benchmarks/benchmark.config.sh"; do
   name=$(basename "$script")
   if bash -n "$script" 2>/dev/null; then
     pass "$name syntax OK"
@@ -165,6 +176,18 @@ if [ -x "$ROOT/run-pipeline.sh" ]; then
   pass "run-pipeline.sh is executable"
 else
   fail "run-pipeline.sh is not executable"
+fi
+
+# ============================================================
+# 2b. Version Check
+# ============================================================
+section "Version"
+
+if grep -q 'ANVIL_VERSION=' "$ROOT/pipeline.config.sh"; then
+  ANVIL_VER=$(grep 'ANVIL_VERSION=' "$ROOT/pipeline.config.sh" | head -1 | cut -d'"' -f2)
+  pass "ANVIL_VERSION=$ANVIL_VER"
+else
+  fail "ANVIL_VERSION not found in pipeline.config.sh"
 fi
 
 # ============================================================
@@ -188,6 +211,14 @@ if command -v python3 &>/dev/null; then
   else
     fail "benchmarks/target/tasktrack/store.py has syntax errors"
   fi
+  # target-hard Python files
+  for pyf in store.py models.py inventory.py orders.py reports.py cli.py; do
+    if python3 -c "import ast; ast.parse(open('$ROOT/benchmarks/target-hard/invtrack/$pyf').read())" 2>/dev/null; then
+      pass "benchmarks/target-hard/invtrack/$pyf syntax OK"
+    else
+      fail "benchmarks/target-hard/invtrack/$pyf has syntax errors"
+    fi
+  done
 else
   warn "python3 not found, skipping Python syntax check"
 fi
@@ -211,54 +242,7 @@ for jf in "${JSON_FILES[@]}"; do
   fi
 done
 
-# ============================================================
-# 5. DOT Graph Validity
-# ============================================================
-section "DOT Graph"
-
-if [ "$MODE" = "quick" ]; then
-  warn "Skipping DOT validation (quick mode)"
-else
-  # Basic structural checks (no dot command needed)
-  DOT_FILE="$ROOT/pipeline.graph.dot"
-  if grep -q "digraph pipeline" "$DOT_FILE"; then
-    pass "DOT file has digraph declaration"
-  else
-    fail "DOT file missing digraph declaration"
-  fi
-
-  # Check all expected nodes exist
-  DOT_NODES=(phase0 interrogate interrogation_review generate_docs doc_review write_specs holdout_generate implement verify holdout_validate security_audit ship supervisor)
-  for node in "${DOT_NODES[@]}"; do
-    if grep -q "^  $node " "$DOT_FILE"; then
-      pass "DOT node: $node"
-    else
-      fail "DOT node missing: $node"
-    fi
-  done
-
-  # Check critical edges
-  EDGES=(
-    "phase0 -> interrogate"
-    "interrogate -> interrogation_review"
-    "interrogation_review -> generate_docs"
-    "generate_docs -> doc_review"
-    "doc_review -> write_specs"
-    "write_specs -> holdout_generate"
-    "holdout_generate -> implement"
-    "implement -> verify"
-    "verify -> holdout_validate"
-    "holdout_validate -> security_audit"
-    "security_audit -> ship"
-  )
-  for edge in "${EDGES[@]}"; do
-    if grep -q "$edge" "$DOT_FILE"; then
-      pass "DOT edge: $edge"
-    else
-      fail "DOT edge missing: $edge"
-    fi
-  done
-fi
+# DOT graph removed in v3.1 (pipeline phase order defined in PHASE_ORDER config)
 
 # ============================================================
 # 6. Config Completeness
@@ -275,11 +259,11 @@ for var in "${CONFIG_VARS[@]}"; do
   pass "config: $var"
 done
 
-# Verify minimum expected count
-if [ "${#CONFIG_VARS[@]}" -lt 40 ]; then
-  fail "Expected at least 40 config vars, found ${#CONFIG_VARS[@]}"
+# Verify minimum expected count (simplified from 73 to ~20 in v3.1)
+if [ "${#CONFIG_VARS[@]}" -lt 15 ]; then
+  fail "Expected at least 15 config vars, found ${#CONFIG_VARS[@]}"
 else
-  pass "config var count: ${#CONFIG_VARS[@]} (>= 40)"
+  pass "config var count: ${#CONFIG_VARS[@]} (>= 15)"
 fi
 
 # ============================================================
@@ -412,6 +396,35 @@ if grep -n '"docs/artifacts/' "$ROOT/run-pipeline.sh" >/dev/null 2>&1; then
   fail "run-pipeline.sh has hardcoded docs/artifacts/ paths"
 else
   pass "run-pipeline.sh uses config for artifact paths"
+fi
+
+# No bare 'timeout' command in run-pipeline.sh (not available on macOS)
+if grep -n '^\s*timeout ' "$ROOT/run-pipeline.sh" >/dev/null 2>&1; then
+  fail "run-pipeline.sh uses bare 'timeout' (not portable, use _timeout)"
+else
+  pass "run-pipeline.sh uses portable _timeout wrapper"
+fi
+
+# _timeout function defined in run-pipeline.sh
+if grep -q '_timeout()' "$ROOT/run-pipeline.sh"; then
+  pass "run-pipeline.sh defines _timeout portable wrapper"
+else
+  fail "run-pipeline.sh missing _timeout portable wrapper"
+fi
+
+# should_run_phase must not return 0 early before tier filtering
+# This catches the bug where fresh runs bypassed tier checks
+if grep -q 'return 0.*# Not resuming' "$ROOT/run-pipeline.sh"; then
+  fail "should_run_phase has early return that bypasses tier filtering"
+else
+  pass "should_run_phase properly reaches tier filtering"
+fi
+
+# tier_allows_phase called in should_run_phase
+if grep -q 'tier_allows_phase' "$ROOT/run-pipeline.sh"; then
+  pass "run-pipeline.sh calls tier_allows_phase"
+else
+  fail "run-pipeline.sh missing tier_allows_phase"
 fi
 
 # ============================================================

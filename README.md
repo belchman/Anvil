@@ -1,21 +1,18 @@
 # Anvil
 
-Autonomous spec-to-PR pipeline framework for Claude Code. Anvil takes a ticket ID or feature description and autonomously produces a fully-implemented, tested, and reviewed pull request -- zero human interaction required between assignment and PR creation.
+Cost-controlled harness for autonomous Claude Code sessions with quality gates and an audit trail.
 
-## Prerequisites
+**The problem**: AI code generation has no governance. Freestyle Claude ships whatever comes out — no cost ceiling, no quality gate, no audit trail. On hard cross-file tasks, it [consistently misses requirements](#freestyle-failure-modes-why-governance-matters) (BENCH-7: 80/100 on every run, never implements rollback). Costs vary 6x across identical tasks. A runaway session can burn $100 on a typo fix.
 
-- **Claude Code CLI** installed and authenticated
-- **Node.js 18+** (for Agent SDK)
-- **git** with a configured remote
-- **jq** and **bc** (used by the pipeline harness)
-- **GitHub CLI** (`gh`) for PR creation
+**The solution**: Anvil wraps Claude Code with the same controls engineering teams already use — cost ceilings, verification gates, and structured logging. Six tiers from $1 to $50: guard ($1-2) validates freestyle output, nano ($3-5) adds cost tracking, lite ($12-18) adds spec-first discipline and adversarial holdout testing. You match governance to risk.
+
+**When to skip Anvil**: For simple, one-shot tasks where you'll review the output yourself. Freestyle scores 100% on single-module bugs — Anvil can't improve on that.
 
 ## Quick Start
 
 ```bash
-# 1. Clone and configure
-cp .env.example .env
-# Edit .env with your ANTHROPIC_API_KEY and GITHUB_PAT
+# 1. One-command setup (checks prerequisites, creates .env, validates structure)
+./scripts/setup-anvil.sh
 
 # 2. Run the pipeline
 ./run-pipeline.sh "TICKET-ID"
@@ -25,32 +22,84 @@ pip install claude-agent-sdk-python
 python run_pipeline.py "TICKET-ID"
 ```
 
+## Pipeline Tiers
+
+Anvil provides 6 pipeline tiers to match rigor to task complexity and budget:
+
+| Tier | Cost | Time | What runs | Best for |
+|------|------|------|-----------|----------|
+| **guard** | $1-2 | 1-2 min | Context scan + security audit + ship (no implementation) | Post-hoc validation of freestyle output |
+| **nano** | $3-5 | 2-3 min | Context scan + implement + verify only | Bug fixes, config changes, trivial tasks |
+| **quick** | $8-15 | 5-10 min | + spec writing | Simple features, well-defined tasks |
+| **lite** | $12-18 | 10-15 min | + holdout validation (adversarial testing) | Medium features where correctness matters |
+| **standard** | $20-30 | 15-20 min | + doc generation + reviews | Most feature work |
+| **full** | $40-50 | 30+ min | + security audit + dual-pass review | Production features, security-sensitive changes |
+
+**Which tier should I use?** Start with `nano`. It's governed freestyle with cost tracking — 90% of tasks don't need more. Use `guard` to validate freestyle output you've already generated. Escalate to `lite` for cross-file changes where correctness matters. Use `standard`/`full` only in regulated environments.
+
+```bash
+# CLI flag (preferred)
+./run-pipeline.sh "TICKET-ID" --tier lite
+
+# Environment variable
+PIPELINE_TIER=lite ./run-pipeline.sh "TICKET-ID"
+
+# Auto-detect (default) — phase0 estimates scope 1-5, maps to tier
+./run-pipeline.sh "TICKET-ID"
+```
+
+## Prerequisites
+
+- **Claude Code CLI** (`claude`) installed and authenticated
+- **git** with a configured remote
+- **jq** (JSON processing)
+- Optional: **bc** (precise math), **gh** (PR creation), **python3** (Python runner + benchmarks)
+
 ## Configuration
 
-### pipeline.config.sh
-Centralized configuration for all phase limits: models, max turns, budgets, timeouts, retry limits, and stagnation detection thresholds. Source this file to customize cost/quality tradeoffs.
+**Most users change nothing.** The defaults work. If you need to adjust:
 
-### pipeline.models.json
-CSS-like model stylesheet. Defines the default model and per-phase-type overrides (routing, review, generation, implementation, security, holdout, healer, supervisor) with cost weights.
+- **`--tier lite`** (CLI flag or `PIPELINE_TIER` env var) — the only setting most teams touch
+- **`MAX_PIPELINE_COST`** — hard ceiling per run (default: $50)
+- **`REVIEW_VALIDATOR_COMMAND`** — plug in your own validators (non-LLM validator included and enabled by default)
 
-### .env
-Environment variables for API keys, autonomous mode toggle, cost ceiling, and model overrides.
+Everything else (`pipeline.config.sh`: 20 variables, `pipeline.models.json`: per-phase model overrides, `.env`: API keys) has sensible defaults. Variables are grouped into Essential (3), Cost (6), Quality (4), and Advanced (7).
 
-## Pipeline Phases
+## What Each Tier Runs
 
-The pipeline executes 9 stages in sequence, with gate-based routing between them:
+Phases activate progressively. Lower tiers skip expensive governance phases:
 
-| Stage | Name | Description |
-|-------|------|-------------|
-| 1 | **Context Scan** | Scans git state, Memory MCP, project type, blockers |
-| 2 | **Interrogation** | Autonomous requirements gathering across all 13 sections |
-| 3 | **Interrogation Review** | LLM-as-judge evaluates completeness (gate: >= 70%) |
-| 4 | **Doc Generation** | Generates all project docs from templates |
-| 5 | **Doc Review** | LLM-as-judge validates docs (gate: >= 80%) |
-| 6 | **Implementation** | Executes each step from IMPLEMENTATION_PLAN.md |
-| 7 | **Holdout Validation** | Tests against hidden adversarial scenarios (gate: >= 80%) |
-| 8 | **Security Audit** | Scans for OWASP vulnerabilities and hardcoded secrets |
-| 9 | **Ship** | Final test suite, PR creation, push |
+| Phase | guard | nano | quick | lite | standard | full |
+|-------|:-----:|:----:|:-----:|:----:|:--------:|:----:|
+| Context Scan | Y | Y | Y | Y | Y | Y |
+| Interrogation | — | — | Y | Y | Y | Y |
+| Spec Writing (BDD) | — | — | Y | Y | Y | Y |
+| Holdout Generation | — | — | — | Y | Y | Y |
+| Implementation + verify | — | Y | Y | Y | Y | Y |
+| Holdout Validation | — | — | — | Y | Y | Y |
+| Doc Generation | — | — | — | — | Y | Y |
+| Doc Review | — | — | — | — | Y | Y |
+| Security Audit | Y | — | — | — | — | Y |
+| Ship | Y | Y | Y | Y | Y | Y |
+
+**guard** ($1-2) validates existing code without re-implementing — post-hoc security + quality check. **nano** ($3-5) is governed freestyle: cost tracking + structured logging. **lite** ($12-18) is the sweet spot for production: spec-first discipline + adversarial holdout testing. **full** ($40-50) is for regulated environments needing documentation + security audit.
+
+## External Validators (Non-LLM Review by Default)
+
+Every review gate runs a non-LLM validator **by default** (`REVIEW_VALIDATOR_COMMAND="./scripts/review-validator.sh"` in `pipeline.config.sh`). This 120-line script runs real static analysis — bash/Python/JSON syntax checking, hardcoded secret scanning, anti-pattern detection, and test suite execution. Zero LLM involvement. The strictest verdict across LLM review and external validation wins.
+
+This is layered on top of cross-model diversity (Sonnet writes specs, Opus implements). Swap in any validator:
+
+```bash
+# Different model family
+REVIEW_VALIDATOR_COMMAND="ollama run llama3 < /dev/stdin"
+
+# Your existing tooling
+REVIEW_VALIDATOR_COMMAND="mypy --strict src/ && ruff check src/"
+
+# Any script that outputs PASS/FAIL/ITERATE with a score
+REVIEW_VALIDATOR_COMMAND="python3 my_validator.py"
+```
 
 ## Exit Codes
 
@@ -62,159 +111,135 @@ The pipeline executes 9 stages in sequence, with gate-based routing between them
 | 3 | Blocked - implementation step failed after max retries |
 | 4 | Holdout Failure - implementation doesn't meet hidden test scenarios |
 
-## Kill Switch
+## Safety Controls
 
-Create a `.pipeline-kill` file in the project root to immediately stop the pipeline at the next phase boundary:
-
-```bash
-# Stop the pipeline
-touch .pipeline-kill
-
-# Re-enable
-rm .pipeline-kill
-```
-
-## Cost Management
-
-- **Per-phase budgets**: Each phase has a `--max-budget-usd` ceiling (configured in `pipeline.config.sh`)
-- **Pipeline ceiling**: `MAX_PIPELINE_COST` environment variable (default: $50)
+- **Kill switch**: `touch .pipeline-kill` stops at next phase boundary, `rm .pipeline-kill` to re-enable
+- **Cost ceiling**: `MAX_PIPELINE_COST` (default: $50), per-phase budgets in `pipeline.config.sh`
 - **Cost tracking**: Per-phase costs logged to `docs/artifacts/pipeline-runs/*/costs.json`
-- **Cost report**: Run `/cost-report` in interactive mode to see historical spend
+- **Stagnation detection**: >90% similar errors across retries triggers reroute
+- **CI/CD**: GitHub Actions workflow at `.github/workflows/autonomous-pipeline.yml` — triggers on `agent-ready` label or `workflow_dispatch`
+- **Interactive mode**: `claude` then `/phase0` — the agent asks the human at each decision point instead of assuming
 
-## CI/CD Integration
+## What's Included
 
-A GitHub Actions workflow is included at `.github/workflows/autonomous-pipeline.yml`. It triggers on:
-- Issues labeled `agent-ready`
-- Manual `workflow_dispatch` with a ticket ID
+**Deploy to any project** (~30 core files): `run-pipeline.sh`, `run_pipeline.py`, `pipeline.config.sh` (20 variables), `pipeline.models.json`, `.claude/` (7 skills, 2 agents, 2 rules), `scripts/` (setup, test, benchmark, validator), `.github/workflows/` (CI/CD).
 
-Required secrets: `ANTHROPIC_API_KEY`, `GITHUB_TOKEN`.
+**Benchmark suite** (~55 additional files): 2 target projects (simple + hard), 10 tickets with expected scoring, automated scorer, benchmark runner.
 
-Pipeline logs are uploaded as artifacts on every run.
+**Skills**: `/phase0`, `/interrogate`, `/feature-add`, `/cost-report`, `/heal`, `/error-analysis`, `/update-progress`. **Agents**: `healer` (auto-fix), `supervisor` (monitoring). **Rules**: `no-assumptions.md`, `context-management.md`.
 
-## Interactive vs Autonomous Mode
+## Benchmarks
 
-### Autonomous Mode
-```bash
-./run-pipeline.sh "TICKET-ID"
-```
-Runs the full pipeline headlessly. The agent searches MCP sources, infers from codebase patterns, and makes tagged assumptions (`[ASSUMPTION: rationale]`) when data is unavailable.
+Anvil includes a reproducible benchmark suite for measuring code quality with zero LLM involvement in scoring.
 
-### Interactive Mode
-```bash
-claude
-# Then: /phase0
-```
-The agent asks the human for input at each decision point. No assumptions are made -- all unknowns are surfaced as questions.
+### Two Target Projects
 
-## Directory Structure
+| Target | Size | Modules | Seeded Defects | Tickets |
+|--------|------|---------|----------------|---------|
+| **simple** (`benchmarks/target/`) | 130 lines | 1 (tasktrack) | 3 (off-by-one, code injection, missing feature) | BENCH-1..5 |
+| **hard** (`benchmarks/target-hard/`) | 430 lines | 6 (invtrack) | 5 cross-file bugs requiring multi-file reasoning | BENCH-6..10 |
 
-```
-.
-├── CLAUDE.md                          # Quick reference (< 50 lines)
-├── CONTRIBUTING_AGENT.md              # Development process - BDD discipline for agents
-├── run-pipeline.sh                    # Bash pipeline harness
-├── run_pipeline.py                    # Python Agent SDK alternative
-├── pipeline.config.sh                 # Phase limits configuration
-├── pipeline.models.json               # Model stylesheet
-├── pipeline.graph.dot                 # Pipeline graph definition
-├── .env.example                       # Environment template
-├── progress.txt                       # Fallback persistence
-├── lessons.md                         # Fallback persistence
-├── decisions.md                       # Fallback persistence
-├── .claude/
-│   ├── settings.json                  # Permissions and hooks
-│   ├── skills/                        # Skill definitions (SKILL.md per directory)
-│   │   ├── phase0/                    # Context scan
-│   │   ├── interrogate/               # Requirements gathering
-│   │   ├── feature-add/               # Quick feature addition
-│   │   ├── cost-report/               # Cost analysis
-│   │   ├── parallel-docs/             # Agent Teams doc generation
-│   │   ├── satisfaction-score/         # Quality scoring
-│   │   ├── generate-dtu/              # Digital twin mocks
-│   │   ├── update-progress/           # Progress tracking
-│   │   ├── error-analysis/            # Error pattern detection
-│   │   ├── heal/                      # Self-healing
-│   │   └── oracle-verify/             # Oracle verification
-│   ├── agents/                        # Agent definitions
-│   │   ├── healer.md                  # Self-healing agent
-│   │   └── supervisor.md              # Pipeline supervisor
-│   └── rules/                         # Auto-applied rules
-│       ├── no-assumptions.md          # Assumptions policy
-│       ├── context-fidelity.md        # Context management
-│       ├── context-budget.md          # Token budgeting
-│       └── compaction.md              # FIC pattern
-├── .github/
-│   └── workflows/
-│       └── autonomous-pipeline.yml    # CI/CD trigger
-├── scripts/
-│   ├── agent-test.sh                  # AI-optimized test runner
-│   └── test-anvil.sh                  # Framework self-test suite
-├── docs/
-│   ├── MEMORY_MCP_SCHEMA.md           # Entity naming reference
-│   ├── templates/                     # Document templates
-│   │   ├── PRD.md
-│   │   ├── APP_FLOW.md
-│   │   ├── TECH_STACK.md
-│   │   ├── DATA_MODELS.md
-│   │   ├── API_SPEC.md
-│   │   ├── FRONTEND_GUIDELINES.md
-│   │   ├── IMPLEMENTATION_PLAN.md
-│   │   ├── TESTING_PLAN.md
-│   │   ├── SECURITY_CHECKLIST.md
-│   │   ├── OBSERVABILITY.md
-│   │   └── ROLLOUT_PLAN.md
-│   ├── summaries/                     # Tier 2: Pyramid summaries
-│   └── artifacts/                     # Tier 3: Full outputs
-│       └── pipeline-runs/             # Per-run logs and costs
-└── .holdouts/                         # Hidden test scenarios
-```
+The hard target's bugs span module boundaries (e.g., cache mutation aliasing between store.py and inventory.py, missing rollback across orders.py and inventory.py) — the kind of defects that require reading multiple files together.
 
-## Skills Reference
+### Automated Scorer
 
-| Skill | Description |
-|-------|-------------|
-| `/phase0` | Context scan - mandatory session start |
-| `/interrogate` | Full requirements gathering (13 sections) |
-| `/generate-docs` | Generate all project documentation |
-| `/verify` | Run verification gate on implementation |
-| `/ship` | Pre-flight checks and PR creation |
-| `/cost-report` | Historical pipeline cost analysis |
-| `/heal` | Run self-healing agent |
-| `/feature-add` | Quick single-feature addition |
-| `/update-progress` | Update PROGRESS.md and Memory MCP |
-| `/satisfaction-score` | Calculate quality score for phase output |
-| `/parallel-docs` | Generate docs in parallel via Agent Teams |
-| `/generate-dtu` | Create mock services for API testing |
-| `/oracle-verify` | Reference-based verification |
-| `/error-analysis` | Cross-run error pattern detection |
+`benchmarks/score.py` provides 11 check types (AST parsing, pytest execution, grep patterns, file existence, test counting) with weighted scoring. No LLM involvement — pure static analysis + test execution. Each ticket has a JSON spec defining its quality checks.
 
-## Agents Reference
-
-| Agent | Role |
-|-------|------|
-| **healer** | Observes pipeline failures, clusters errors, generates and applies fixes |
-| **supervisor** | Monitors cross-phase metrics, detects anomalies, can override routing |
-
-## Rules Reference
-
-| Rule | Scope | Purpose |
-|------|-------|---------|
-| `no-assumptions.md` | `**/*` | Assumptions policy for interactive/autonomous modes |
-| `context-fidelity.md` | `**/*` | Six fidelity modes for context loading |
-| `context-budget.md` | `**/*` | Token budget estimation per phase |
-| `compaction.md` | `**/*` | Frequent Intentional Compaction (FIC) pattern |
-
-## Python Alternative
-
-`run_pipeline.py` provides the same pipeline logic as the bash harness but with:
-- Structured Python dataclasses (`PhaseConfig`, `PhaseResult`, `PipelineState`)
-- Proper async/await with timeout handling
-- Type-safe verdict and satisfaction score parsing
-- Extensible hooks via Claude Agent SDK
+### Running Benchmarks
 
 ```bash
-pip install claude-agent-sdk-python
-python run_pipeline.py "TICKET-ID"
+# Run all tickets on simple target (freestyle only)
+./scripts/run-benchmark.sh --target target --approach freestyle
+
+# Run hard tickets (multi-file bugs)
+./scripts/run-benchmark.sh --target target-hard --approach freestyle
+
+# Compare Anvil vs freestyle
+./scripts/run-benchmark.sh --target target-hard --approach both
+
+# Single ticket
+./scripts/run-benchmark.sh --target target-hard --ticket BENCH-6 --approach freestyle
 ```
 
-Use the bash harness for quick setup and CI/CD. Use the Python runner for production deployments needing structured error handling and extensibility.
+Evidence output: `docs/artifacts/benchmark-*/benchmark-evidence.json` with per-ticket scores, costs, and cost-per-quality-point metrics.
+
+### Benchmark Results
+
+**Scorer discrimination** (unfixed targets — proves checks are real gates, not rubber stamps):
+
+| Target | Unfixed Baseline | Description |
+|--------|-----------------|-------------|
+| Simple | 48/100 avg | 3 seeded defects in single module |
+| Hard | 39/100 avg | 5 cross-file bugs across 6 modules |
+
+**Freestyle (Claude Code, no pipeline) results:**
+
+| Target | Tickets | Avg Score | Total Cost | Avg Time |
+|--------|---------|-----------|------------|----------|
+| Simple (BENCH-1..5) | 5 | **100/100** | $1.23 | 54s |
+| Hard (BENCH-6..10) | 5 | **92/100** | $2.30 | 119s |
+
+Hard target breakdown:
+
+| Ticket | Task | Score | What freestyle missed |
+|--------|------|-------|-----------------------|
+| BENCH-6 | Fix mutation aliasing (store→inventory) | 90/100 | `last_adjusted` mutation still present in inventory.py |
+| BENCH-7 | Add rollback to order processing | 80/100 | No rollback tracking variable in place_order() |
+| BENCH-8 | Fix pagination off-by-one | 100/100 | — |
+| BENCH-9 | Security audit: fix all validation gaps | 90/100 | BUG comments left in reports.py and inventory.py |
+| BENCH-10 | Refactor: extract Validator class | 100/100 | — |
+
+### Freestyle Failure Modes (Why Governance Matters)
+
+Variance studies (5 identical runs per ticket) reveal two distinct failure patterns on hard cross-file bugs:
+
+**BENCH-6** — cache mutation aliasing (store.py → inventory.py), N=5:
+
+| Runs | Score | What happened |
+|------|-------|---------------|
+| 1 of 5 | **55/100** | Missed copy fix entirely, mutation present, no test added |
+| 4 of 5 | 90/100 | Fixed copy but `last_adjusted` mutation remains in inventory.py |
+
+Mean: 83, Range: **35 points**. One in five runs drops from "ships" to "fails review."
+
+**BENCH-7** — missing rollback (orders.py → inventory.py), N=5:
+
+| Runs | Score | What happened |
+|------|-------|---------------|
+| 5 of 5 | **80/100** | Never adds rollback tracking to `place_order()` |
+
+Mean: 80, Range: **0 points**. Running freestyle 100 times won't fix it. The model consistently misses transactional rollback for partial failures — a 20-point quality ceiling.
+
+**Two failure modes that governance targets:**
+- **Stochastic drops** (BENCH-6): Verification retries catch defects; if unfixable, the pipeline blocks rather than shipping silently. Measured on BENCH-6: pipeline detected `last_adjusted` mutation and blocked.
+- **Systematic blind spots** (BENCH-7): Holdout validation generates adversarial test scenarios before implementation (e.g., "order fails on item 3 — are items 1-2 rolled back?"). Designed to catch exactly the class of missing-requirement defects that freestyle consistently ships.
+
+BENCH-8 through BENCH-10 showed zero variance and 93-100/100 scores. Freestyle handles simple and medium tasks well — governance overhead is concentrated where it's needed most.
+
+### Anvil Lite Head-to-Head (BENCH-6)
+
+| Metric | Freestyle | Anvil Lite |
+|--------|-----------|------------|
+| Quality score | 90/100 | 90/100 |
+| Cost | $0.44 | $5.67 |
+| Time | 99s | 21 min |
+| Verification | None — ships whatever comes out | 3 retry cycles caught residual `last_adjusted` mutation |
+| Audit trail | None | Per-phase costs, models, turns logged |
+| Cost predictability | $0.24-$1.45 (6x range across runs) | Bounded by per-phase budgets |
+
+Anvil doesn't claim higher scores — it provides governance. The pipeline detected the residual mutation, retried implementation three times, and when verification kept failing, blocked rather than shipping. Freestyle shipped the same quality code without knowing anything was wrong. The difference is visibility and control, not magic.
+
+**Where the $5.67 went**: $2.25 governance overhead (context scan, interrogation, specs, holdout generation) + $3.42 implementation with verification retries. For most tasks, **nano** ($3-5) or **guard** ($1-2) is sufficient — escalate to lite only for cross-file changes where BENCH-7's quality ceiling applies.
+
+### Dogfooding: Benchmarks as Integration Tests
+
+Running the benchmark suite against Anvil itself found 5 pipeline bugs (all fixed) that structural self-tests missed — tier filtering broken, macOS incompatibility, config overrides ignored. This is the same principle Anvil applies to AI-generated code: end-to-end testing catches what unit tests miss. The benchmark suite now serves as Anvil's own integration test layer.
+
+## Self-Test Suite
+
+```bash
+./scripts/test-anvil.sh        # Full suite (192 checks)
+./scripts/test-anvil.sh quick  # Skip slow checks
+```
+
+Validates: file inventory, bash/Python/JSON syntax, config completeness, cross-references, portability, security, and version tracking. Python alternative: `run_pipeline.py` provides the same logic via Claude Agent SDK with structured dataclasses and async/await.

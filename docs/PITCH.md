@@ -1,127 +1,80 @@
-# Anvil: The Pitch (For and Against)
+# Anvil — Dual Pitch Evaluation
 
-## FOR: Why This Is the Correct Approach (~2 min read)
+## FOR Pitch (Advocate)
 
-The fundamental problem with AI-assisted coding today is that it operates at the wrong level of abstraction. You give a model a prompt, it writes code, you eyeball it, you ship it. That workflow has no memory, no verification, no separation of concerns, and no cost control. It works for 50-line scripts. It falls apart at 500 lines. It is outright dangerous at 5,000.
+Anvil solves a real, measurable problem: uncontrolled AI code generation. The README doesn't just claim governance matters — it proves it with variance studies showing freestyle drops 35 points on identical inputs (BENCH-6: 55-90 range) and hits hard quality ceilings the model can't escape (BENCH-7: 80/100 on all 5 runs). This is the rare AI tooling project that leads with honest limitations.
 
-Anvil addresses this by treating AI code generation as an **engineering pipeline** rather than a conversation. The thesis: if you constrain an LLM with the same discipline you would apply to a junior developer -- specification before implementation, review before merge, separation of generator and reviewer -- you get dramatically more reliable output.
+### Dimension Scores
 
-**The pipeline is real and concrete.** `run-pipeline.sh` (1,224 lines) and `run_pipeline.py` (1,197 lines) implement 11 phases: context scan, interrogation, interrogation review, doc generation, doc review, spec writing, holdout generation, implementation, holdout validation, security audit, and ship. Each phase has per-phase model selection, budget caps, turn limits, and timeouts defined in `pipeline.config.sh` (45+ config variables). The routing graph (`pipeline.graph.dot`) defines every legal state transition. This is not a README describing a dream -- it is a functioning state machine with circuit breakers.
+**Correctness: 8/10** (weight: 25%)
+The 192-test self-test suite, 10-ticket benchmark suite with zero-LLM scoring, and the unfixed baseline scores (48/100 simple, 39/100 hard) prove the checks are real gates, not rubber stamps. The scorer uses 11 check types including AST parsing and pytest execution. The dogfooding section admits the benchmarks found 5 pipeline bugs that structural tests missed — evidence of genuine testing rigor. Deducted points: BENCH-7's systematic blind spot (80/100 ceiling) is identified but the README only says holdout validation is "designed to catch" it — no evidence it actually does.
 
-**Cross-model review eliminates the same-brain problem.** Sonnet writes the specs (RED phase). Opus implements to make them pass (GREEN phase). Sonnet reviews Opus's work. The review gate runs dual-pass evaluation with position bias mitigation -- sections are evaluated in normal order, then reversed order, with the stricter verdict winning. An external review validator (`review-validator.sh`) runs real static analysis -- bash syntax checking, Python AST parsing, JSON validation, security scans -- breaking the "LLM reviewing LLM" loop entirely.
+**Cost Efficiency: 9/10** (weight: 20%)
+Six tiers from $1-$50 with clear guidance: "Start with nano. 90% of tasks don't need more." The head-to-head table is brutally honest — Anvil Lite costs 13x more than freestyle for the same 90/100 score. The README frames this correctly as governance overhead, not quality improvement. Per-phase cost tracking to `costs.json`, `MAX_PIPELINE_COST` ceiling, and the explicit "When to skip Anvil" section show maturity. The $50 hard ceiling prevents runaway sessions.
 
-**Holdout scenarios are adversarial specifications the implementer never sees.** One model generates edge cases. A different model validates the implementation against them. The implementing agent has no access to the holdout scenarios during coding. This separation is the closest thing to genuine independent verification you can get from a pipeline that runs autonomously.
+**Rigor: 9/10** (weight: 15%)
+BDD spec-before-code discipline, cross-model diversity (Sonnet specs, Opus implements), non-LLM external validators by default, adversarial holdout testing, stagnation detection at >90% error similarity, and kill switches. The phase matrix showing exactly which tiers run which phases is excellent. Exit codes are well-defined (0-4). The "strictest verdict wins" policy across LLM review and external validation is a strong safety posture.
 
-**Cost governance is built in, not bolted on.** The `pipeline.models.json` stylesheet assigns Opus ($1.0 weight) to generation and Sonnet ($0.2 weight) to review and routing. Four pipeline tiers -- full ($40-50), standard ($20-30), quick ($8-15), nano ($3-5) -- let you match rigor to scope. Phase 0 auto-detects scope and selects the tier. Per-phase budgets, a $50 pipeline ceiling, a kill switch (`.pipeline-kill`), and stagnation detection (>90% error similarity triggers reroute) prevent runaway spend.
+**Usability: 7/10** (weight: 15%)
+One-command setup (`setup-anvil.sh`), single invocation (`./run-pipeline.sh TICKET-ID`), CLI `--tier` flag, sensible defaults ("most users change nothing"). The tier recommendation table is clear. Interactive mode via `/phase0` is available. However, ~30 core files to deploy is non-trivial, prerequisites include Claude Code CLI + jq + optional bc/gh/python3, and the configuration surface (20 variables, models JSON, .env) could overwhelm despite the "you don't need to touch it" framing.
 
-**Context discipline treats the token window as a budget.** Six fidelity modes (full, truncate, compact, summary:high/medium/low) control how much prior-phase context loads into each new session. Auto-adjustment downgrades fidelity when estimated tokens exceed 60% of the window. The Frequent Intentional Compaction (FIC) pattern forces large outputs to disk with pyramid summaries. This is not theoretical -- the `select_fidelity()` function exists in both runners.
+**Evidence Quality: 9/10** (weight: 10%)
+Variance studies with N=5 per ticket, per-run breakdowns, cost-per-quality-point metrics, and the unfixed baseline proving scorer discrimination. The BENCH-6 head-to-head table showing identical scores but different governance properties is honest evidence. The README explicitly states what freestyle does well (simple tasks: 100/100) rather than cherry-picking failures. Deducted for: no Anvil results on BENCH-7 (the hardest case), and variance studies are N=5 which is small.
 
-**The framework validates itself -- and now benchmarks itself.** `test-anvil.sh` (252 tests) checks file inventory, syntax validity, JSON structure, DOT graph integrity, config completeness, cross-reference integrity, portability, and security. `self-validate.sh` runs the framework's own review tools against itself. The benchmark suite (`benchmarks/`) provides a controlled, reproducible comparison against a purpose-built target project with seeded defects, automated quality scoring (0-100 per ticket, 8 check types, no LLM involvement in scoring), and machine-readable evidence output. The benchmark infrastructure has been run end-to-end and produces real data (see Evidence section below).
+**Innovation: 7/10** (weight: 10%)
+Tiered governance for AI code generation is a novel framing. The guard tier (post-hoc validation of existing output) is clever — it governs without re-implementing. Adversarial holdout generation before implementation targets systematic blind spots specifically. The pluggable validator interface (`REVIEW_VALIDATOR_COMMAND`) bridges AI governance with existing tooling. Not revolutionary technology, but a novel application of engineering controls to AI output.
 
-**It is portable.** 61+ files, zero external dependencies beyond `claude`, `jq`, `git`, and optionally `bc` and `gh`. Drop it into any project. The CI/CD workflow triggers on an `agent-ready` label or manual dispatch. 11 skills, 2 agents (healer, supervisor), 4 rules, 11 doc templates. It does not care what language your project uses.
+**Maintenance: 7/10** (weight: 5%)
+192 self-tests, benchmark suite as integration tests, version tracking (ANVIL_VERSION=3.1), config consolidation from 73 to 20 variables showing active simplification. The Python runner provides an alternative implementation path. Concerns: ~30 core files + ~55 benchmark files is a significant surface area, and the bash harness at ~1280 lines will be painful to maintain long-term.
 
-The bet: structure beats freestyle. Verification beats vibes. Specification before implementation is not bureaucracy -- it is how you prevent an LLM from confidently shipping hallucinated code.
-
----
-
-## AGAINST: Why This Is the Wrong Approach (~2 min read)
-
-Let us be honest about what Anvil actually is: **a 2,400-line harness that orchestrates a chatbot to follow a waterfall process, and the entire value proposition depends on the chatbot being obedient to its own system prompts.**
-
-Start with the economics. The "full" tier costs $40-50 per ticket. For a team shipping 10 tickets a day, that is $400-500/day in API costs -- $10,000/month -- to produce code that still requires human review because no sane engineering organization will merge AI-generated PRs without looking at them. The "nano" tier costs $3-5 but skips holdouts, security audit, and spec writing -- which means it skips everything that supposedly makes Anvil better than just prompting Claude directly. The tiers that are cheap enough to use regularly are the tiers that remove Anvil's differentiators.
-
-The "cross-model review" is theater. Sonnet and Opus are both Anthropic models trained on overlapping data with similar failure modes. Calling this "cross-model diversity" is like getting a second opinion from a doctor at the same hospital who trained under the same attending. The dual-pass bias mitigation (evaluating sections in normal then reversed order) addresses a real problem -- position bias -- but position bias is roughly the 47th most important failure mode of LLM code review. The top failure mode is that LLMs are bad at catching subtle logical errors, and no amount of section reordering fixes that.
-
-The holdout system is Anvil's most interesting idea, and also its most fragile. The holdouts are generated by an LLM. The validation is performed by an LLM. The separation between generator and validator exists only at the prompt level -- both models share the same training data, the same reasoning patterns, and the same blind spots. If Opus cannot imagine an edge case while implementing, there is a meaningful probability that Opus also cannot imagine it while generating holdout scenarios. You are testing the model's imagination against its own imagination with a different system prompt.
-
-The `review-validator.sh` is marketed as breaking the "LLM reviewing LLM" loop. It checks bash syntax, Python AST parsing, JSON validity, no hardcoded secrets, and no eval with user input. That is a linter. It is a useful linter, but calling it a "non-LLM review validator" implies a level of semantic code review that is not happening. It cannot detect logical bugs, incorrect business logic, race conditions, or any of the defects that actually matter in production code. The verdicts it produces (PASS/FAIL) have the granularity of a smoke test.
-
-**The benchmark results complicate the narrative.** The initial benchmark run (5 tickets, 3 seeded defects in a ~130-line Python project) scored freestyle Claude at 100/100 on all 5 tasks in 309 seconds total. No Anvil overhead, no multi-phase pipeline, no document generation -- just a single prompt with the ticket description. Every bug was fixed, every feature was added, every test was written. If a single prompt produces perfect output on the benchmark suite, what exactly is Anvil adding? The answer is "governance for when the task is harder" -- but the benchmark hasn't proven that yet because the target project is deliberately small. The benchmark proves Anvil's testing infrastructure works. It does not yet prove Anvil produces better code than prompting Claude directly.
-
-The 252-test self-test suite sounds impressive until you realize what it tests: file existence, syntax validity, JSON parsing, cross-reference integrity, and portability. It validates that Anvil's files are well-formed. It does not test that the pipeline produces correct code. It does not test that the holdout system catches real bugs. It does not test that the cost tracking is accurate. It does not test that the context fidelity system actually prevents context overflow. The benchmark suite is a step toward integration testing, but the current target project (130 lines, 3 seeded defects) is not complex enough to expose the failure modes that Anvil is designed to prevent.
-
-The documentation overhead is staggering. 11 document templates (PRD, APP_FLOW, TECH_STACK, DATA_MODELS, API_SPEC, FRONTEND_GUIDELINES, IMPLEMENTATION_PLAN, TESTING_PLAN, SECURITY_CHECKLIST, OBSERVABILITY, ROLLOUT_PLAN) generated for every feature -- even with adaptive selection, you are asking an LLM to produce thousands of words of documentation that will be read by another LLM. This is AI busywork: models writing documents for models to read. The documentation is not for humans. It is not maintained by humans. It will not be accurate 30 days after generation. It is ceremony masquerading as rigor.
-
-The "Interrogation Protocol" asks 13 sections of requirements questions. In autonomous mode, the agent searches MCP sources, infers from codebase patterns, and makes tagged assumptions. In practice, most codebases do not have Jira, Confluence, Slack, and Google Drive all wired up via MCP. The agent will make a pile of `[ASSUMPTION: rationale]` tags and proceed on best guesses. The assumptions review is performed by... another LLM. The assumptions that matter most (auth models, compliance requirements, data retention policies) are exactly the ones the LLM is least qualified to assume.
-
-The entire architecture assumes that more process equals better output. But the process itself runs on LLMs, which means every phase introduces its own error rate. An 11-phase pipeline where each phase has a 90% success rate produces end-to-end success only 31% of the time. The retry loops and gate thresholds mitigate this, but they also multiply cost. A failed holdout validation routes back to implementation, which routes through verify again, which may fail and route back again. The cost ceiling exists because without it, the pipeline would happily spend hundreds of dollars retrying itself into oblivion.
-
-The honest assessment: **show me a 1,000-line codebase where Anvil catches a bug that freestyle Claude misses, and the pitch becomes compelling. Until then, it is well-engineered infrastructure awaiting its justification.**
+### FOR Weighted Score
+(8×0.25) + (9×0.20) + (9×0.15) + (7×0.15) + (9×0.10) + (7×0.10) + (7×0.05) = 2.00 + 1.80 + 1.35 + 1.05 + 0.90 + 0.70 + 0.35 = **8.15/10**
 
 ---
 
-## Benchmark Evidence
+## AGAINST Pitch (Critic)
 
-### Setup
+Anvil is a 1,280-line bash script wrapping an AI tool, solving a problem that affects maybe 5% of AI coding tasks — and the README's own data proves it. Freestyle scores 100/100 on simple tasks and 92/100 on hard tasks. The governance overhead costs 13x more and takes 13x longer for identical quality scores. This is enterprise process theater applied to a tool that mostly works fine.
 
-A controlled target project (`benchmarks/target/`): a 130-line Python CLI task tracker with 3 seeded defects:
+### Dimension Scores
 
-1. **Off-by-one bug**: `complete()` uses list index instead of dict key lookup -- breaks after any deletion
-2. **Code injection**: `eval(data)` fallback in `_load()` -- CWE-95 vulnerability
-3. **Missing feature**: no `search()` method or CLI subcommand
+**Correctness: 5/10** (weight: 25%)
+The README's showpiece evidence undermines itself. Anvil Lite on BENCH-6: same 90/100 as freestyle. Where's the BENCH-7 result — the ticket with the "quality ceiling" that governance supposedly fixes? Conspicuously absent. The holdout validation is described as "designed to catch" BENCH-7's failure mode but no evidence it actually does. The variance study is N=5 — statistically meaningless. The 192 self-tests validate file inventory and syntax, not pipeline correctness. No evidence that any tier actually produces higher-quality code than freestyle on any benchmark.
 
-5 baseline tests (happy paths only, all passing). Automated quality scorer (`benchmarks/score.py`) with 8 check types, no LLM involvement in scoring.
+**Cost Efficiency: 4/10** (weight: 20%)
+The README's own data: freestyle costs $0.44 for 90/100, Anvil Lite costs $5.67 for... 90/100. That's $5.23 of pure overhead for zero quality improvement. The "governance overhead" framing is spin — you're paying 13x more for an audit trail that tells you the code has the same bugs. The tier system creates decision paralysis: 6 tiers, 20 config variables, a models JSON file. "Most users change nothing" is an admission that the configuration surface shouldn't exist. The $50 ceiling protects against runaway costs that Anvil itself creates.
 
-### Results: Freestyle Baseline (2026-02-25)
+**Rigor: 6/10** (weight: 15%)
+Cross-model diversity and non-LLM validators are genuinely good ideas, but the rigor is theater without outcome data. The external validator is 120 lines of bash running syntax checks and grep for secrets — not meaningfully different from a pre-commit hook. "Strictest verdict wins" sounds rigorous but the README shows no case where the validator caught something the LLM missed (or vice versa). Stagnation detection, kill switches, and exit codes are nice engineering but they're process controls, not quality controls.
 
-| Ticket | Scope | Task | Score | Time |
-|--------|-------|------|-------|------|
-| BENCH-1 | nano | Fix off-by-one in `complete()` | 100/100 | 43s |
-| BENCH-2 | quick | Add search feature | 100/100 | 47s |
-| BENCH-3 | quick | Add tests (no source changes) | 100/100 | 45s |
-| BENCH-4 | standard | Refactor + error handling | 100/100 | 118s |
-| BENCH-5 | nano | Remove `eval()` vulnerability | 100/100 | 56s |
-| **Average** | | | **100/100** | **62s** |
+**Usability: 4/10** (weight: 15%)
+~30 core files deployed into your project. A 1,280-line bash harness. A separate Python runner at ~1,000 lines that's "~95% parity" (what's the other 5%?). Seven skills, two agents, two rules, eleven doc templates. Prerequisites: Claude Code CLI, git, jq, optionally bc, gh, python3. To run: understand tiers, understand phases, understand config variables grouped into Essential/Cost/Quality/Advanced categories. The "one-command setup" requires you to already have Claude Code installed and authenticated. This is not a tool most developers will adopt casually.
 
-**Total time: 309 seconds. All 25 quality checks passed across 5 tickets.**
+**Evidence Quality: 6/10** (weight: 10%)
+The variance studies are honest but methodologically weak: N=5 is too small for statistical claims. The head-to-head comparison is a single ticket (BENCH-6) with a single Anvil run. The README claims Anvil "blocked rather than shipping" on the residual mutation — but the score is still 90/100, same as freestyle. Where are the runs where Anvil actually produces a higher score? The unfixed baselines proving scorer discrimination is good methodology. But the core claim — governance improves outcomes — has no supporting data in the README.
 
-### What This Proves
+**Innovation: 5/10** (weight: 10%)
+Wrapping a tool with cost controls, logging, and validation gates is standard engineering practice — not innovation. CI/CD pipelines have done this for decades. The "tiered governance" concept maps directly to existing concepts: linting (guard) → build (nano) → integration tests (lite) → full pipeline (standard/full). The pluggable validator is just a script that outputs PASS/FAIL — any CI system does this. The holdout testing concept is genuinely interesting but unproven (no outcome data).
 
-1. **The benchmark infrastructure works end-to-end.** Target project, ticket definitions, automated scorer, and runner all function correctly and produce machine-readable evidence.
-2. **Freestyle Claude handles small, well-defined tasks perfectly.** On a 130-line project with explicit ticket descriptions, single-prompt Claude scores 100% -- bugs fixed, features added, tests written, security vulnerabilities removed.
-3. **The scoring system discriminates.** Against the unmodified baseline, BENCH-1 scores 60/100 and BENCH-5 scores 45/100. After Claude's fixes, both score 100/100. The checks are real gates, not rubber stamps.
+**Maintenance: 3/10** (weight: 5%)
+A 1,280-line bash script is a maintenance nightmare. Bash has no type system, no package management, limited testing frameworks, and notoriously fragile string handling. The "~95% parity" Python alternative means maintaining two implementations of the same logic. 85 total files for a wrapper around another tool. The dogfooding section admits the benchmark suite found 5 bugs in the pipeline — evidence of ongoing fragility. Config consolidation from 73 to 20 variables in one version suggests the design is still churning.
 
-### What This Does Not Prove (Yet)
-
-1. **Anvil vs freestyle comparison.** Anvil pipeline runs have not been executed on this benchmark. The comparison requires running `./scripts/run-benchmark.sh --approach both`.
-2. **Behavior at scale.** A 130-line project with 3 seeded defects is a controlled test, not a realistic production codebase. Anvil's value proposition targets complexity that this benchmark does not yet exercise.
-3. **Cost efficiency.** The `claude -p` cost was not captured in this run. Anvil-vs-freestyle cost comparison is pending.
-
-### Next Steps
-
-- Run `./scripts/run-benchmark.sh --approach both` to get Anvil comparison data
-- Add a larger target project (500+ lines, subtler defects, multi-file changes) where freestyle may struggle
-- Capture per-run API costs for honest cost-effectiveness comparison
+### AGAINST Weighted Score
+(5×0.25) + (4×0.20) + (6×0.15) + (4×0.15) + (6×0.10) + (5×0.10) + (3×0.05) = 1.25 + 0.80 + 0.90 + 0.60 + 0.60 + 0.50 + 0.15 = **4.80/10**
 
 ---
 
-## Scoring
+## Summary
 
-| Dimension | Weight | FOR (1-10) | AGAINST (1-10) | Notes |
-|-----------|--------|-----------|----------------|-------|
-| **Correctness improvement** | 25% | 7 | 5 | Cross-model + holdouts are real mechanisms, but unproven at scale. LLM-reviews-LLM is a ceiling. |
-| **Cost efficiency** | 20% | 4 | 7 | $40-50/ticket for full tier is prohibitive. Nano tier removes the differentiators. |
-| **Engineering rigor** | 15% | 9 | 3 | 252 tests, self-validation, benchmark suite, circuit breakers -- the scaffolding is thorough. |
-| **Practical usability** | 15% | 6 | 6 | Drop-in portability is genuine. 61+ files is a lot of framework to adopt. Config surface area is large. |
-| **Evidence of results** | 10% | 5 | 6 | Benchmark infrastructure proven and executed. But freestyle scored 100% on all tasks -- Anvil comparison pending. |
-| **Innovation** | 10% | 8 | 4 | Holdout separation, bias-mitigated review, automated benchmark scoring are genuinely novel for AI pipelines. |
-| **Maintenance burden** | 5% | 5 | 6 | Self-test suite helps. But 2,400+ lines of harness is a lot of framework to keep current as Claude Code evolves. |
+| Dimension | Weight | FOR | AGAINST |
+|-----------|--------|-----|---------|
+| Correctness | 25% | 8 | 5 |
+| Cost Efficiency | 20% | 9 | 4 |
+| Rigor | 15% | 9 | 6 |
+| Usability | 15% | 7 | 4 |
+| Evidence Quality | 10% | 9 | 6 |
+| Innovation | 10% | 7 | 5 |
+| Maintenance | 5% | 7 | 3 |
+| **Weighted Average** | | **8.15** | **4.80** |
 
-### Weighted Score
-
-```
-FOR:     (7*0.25) + (4*0.20) + (9*0.15) + (6*0.15) + (5*0.10) + (8*0.10) + (5*0.05) = 6.30
-AGAINST: (5*0.25) + (7*0.20) + (3*0.15) + (6*0.15) + (6*0.10) + (4*0.10) + (6*0.05) = 5.45
-```
-
-**Final: FOR 6.3 vs AGAINST 5.5 -- a margin of 0.85 points.**
-
-### Interpretation
-
-Anvil is a genuinely engineered framework that solves real problems (context management, cost control, specification discipline) with concrete mechanisms (not just prompts). The engineering quality of the scaffolding is high. The ideas -- particularly holdout separation and cross-model review -- are sound in principle.
-
-The margin has widened from 0.35 to 0.85 since the last assessment, driven primarily by the benchmark infrastructure: Anvil now has a reproducible, automated way to measure its own effectiveness with machine-readable evidence. The "Evidence of results" dimension shifted from FOR=2 to FOR=5 because the benchmark exists and runs -- but not higher because the initial data shows freestyle Claude performing perfectly on the current task set.
-
-The honest next step is clear: add a larger, more complex target project where single-prompt Claude is likely to produce subtler defects (incorrect error handling across module boundaries, missed edge cases in multi-step workflows, security issues that require understanding data flow across files). If Anvil's pipeline catches what freestyle misses on those tasks, the FOR score on "Correctness improvement" jumps to 9 and the overall margin becomes decisive. If it doesn't, the framework's value reduces to cost governance and auditability -- useful, but not transformative.
-
-The benchmark infrastructure itself is now an asset regardless of outcome. It provides a repeatable, LLM-free measurement of code quality that any AI coding tool can be evaluated against.
+**The crux**: The FOR case rests on governance-as-value (audit trails, cost ceilings, blocking bad code) — process maturity for AI-generated code. The AGAINST case rests on outcome data — Anvil hasn't demonstrated it produces better code, only that it costs more and takes longer to produce the same code. Both readings are supported by the README's own evidence. The missing BENCH-7 Anvil result is the most conspicuous gap: it's the ticket where governance should shine, and its absence speaks loudly.

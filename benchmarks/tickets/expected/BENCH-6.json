@@ -1,0 +1,39 @@
+{
+  "ticket": "BENCH-6",
+  "description": "Fix mutation aliasing bug in store/inventory",
+  "checks": [
+    {
+      "type": "ast_parse",
+      "file": "invtrack/store.py",
+      "weight": 5
+    },
+    {
+      "type": "ast_parse",
+      "file": "invtrack/inventory.py",
+      "weight": 5
+    },
+    {
+      "type": "grep_present",
+      "file": "invtrack/store.py",
+      "pattern": "(\\.copy\\(\\)|deepcopy\\(|dict\\(self\\._cache|dict\\(product)",
+      "description": "get_product returns a copy, not a reference",
+      "weight": 25
+    },
+    {
+      "type": "grep_absent_all",
+      "glob": "invtrack/*.py",
+      "pattern": "last_adjusted",
+      "description": "No last_adjusted mutation in any module",
+      "weight": 10
+    },
+    {
+      "type": "pytest",
+      "weight": 40
+    },
+    {
+      "type": "test_count_increased",
+      "baseline": 11,
+      "weight": 15
+    }
+  ]
+}

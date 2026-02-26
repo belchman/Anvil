@@ -54,11 +54,10 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/pipeline.config.sh"
 
-# Auto-discover and validate numeric config values from pipeline.config.sh
+# Validate numeric config values from pipeline.config.sh
 while IFS='=' read -r _cfg_var _cfg_val; do
-  # Skip string configs by naming convention
   case "$_cfg_var" in
-    *_DIR|*_FILE|*_ORDER|*_COMMAND|*_MODE|*_GATES|HOLDOUTS_DIR|PIPELINE_TIER) continue ;;
+    *_COMMAND|*_MODE|*_GATES|PIPELINE_TIER|ANVIL_VERSION) continue ;;
   esac
   if ! [[ "${!_cfg_var:-}" =~ ^[0-9]+\.?[0-9]*$ ]]; then
     echo "[ERROR] Config variable $_cfg_var is not numeric: '${!_cfg_var:-}'"
@@ -67,7 +66,61 @@ while IFS='=' read -r _cfg_var _cfg_val; do
 done < <(grep -E '^[A-Z_][A-Z0-9_]*=' "${SCRIPT_DIR}/pipeline.config.sh")
 unset _cfg_var _cfg_val
 
+# ---- Defaults (override via env vars if needed) ----
+
+# Directory paths
+DOCS_DIR="${DOCS_DIR:-docs}"
+ARTIFACTS_DIR="${ARTIFACTS_DIR:-docs/artifacts}"
+SUMMARIES_DIR="${SUMMARIES_DIR:-docs/summaries}"
+TEMPLATES_DIR="${TEMPLATES_DIR:-docs/templates}"
+HOLDOUTS_DIR="${HOLDOUTS_DIR:-.holdouts}"
+LOG_BASE_DIR="${LOG_BASE_DIR:-docs/artifacts/pipeline-runs}"
+
+# Internal constants
+KILL_SWITCH_FILE="${KILL_SWITCH_FILE:-.pipeline-kill}"
+METRICS_FILE="${METRICS_FILE:-docs/artifacts/pipeline-metrics.json}"
+MAX_NO_PROGRESS="${MAX_NO_PROGRESS:-3}"
+CONTEXT_WINDOW="${CONTEXT_WINDOW:-200000}"
+STAGNATION_SIMILARITY_THRESHOLD="${STAGNATION_SIMILARITY_THRESHOLD:-90}"
+MAX_INTERROGATION_ITERATIONS="${MAX_INTERROGATION_ITERATIONS:-2}"
+FIDELITY_UPGRADE_THRESHOLD="${FIDELITY_UPGRADE_THRESHOLD:-30}"
+FIDELITY_DOWNGRADE_THRESHOLD="${FIDELITY_DOWNGRADE_THRESHOLD:-60}"
+PHASE_ORDER="${PHASE_ORDER:-phase0 interrogate interrogation-review generate-docs doc-review write-specs holdout-generate implement holdout-validate security-audit ship}"
+
+# Phase timeouts (seconds) — override individually via TIMEOUT_PHASE0=120 etc.
+: "${TIMEOUT_PHASE0:=120}"
+: "${TIMEOUT_INTERROGATE:=600}"
+: "${TIMEOUT_REVIEW:=300}"
+: "${TIMEOUT_GENERATE_DOCS:=600}"
+: "${TIMEOUT_IMPLEMENT:=600}"
+: "${TIMEOUT_VERIFY:=300}"
+: "${TIMEOUT_SECURITY:=300}"
+: "${TIMEOUT_HOLDOUT_GENERATE:=300}"
+: "${TIMEOUT_HOLDOUT_VALIDATE:=300}"
+: "${TIMEOUT_WRITE_SPECS:=300}"
+: "${TIMEOUT_SHIP:=300}"
+
 # ---- Helper Functions ----
+
+# Portable timeout: use GNU timeout if available, otherwise a bash-based fallback
+if command -v timeout &>/dev/null; then
+  _timeout() { timeout "$@"; }
+elif command -v gtimeout &>/dev/null; then
+  _timeout() { gtimeout "$@"; }
+else
+  _timeout() {
+    local duration="$1"; shift
+    "$@" &
+    local pid=$!
+    ( sleep "$duration" && kill -TERM "$pid" 2>/dev/null ) &
+    local watchdog=$!
+    wait "$pid" 2>/dev/null
+    local exit_code=$?
+    kill "$watchdog" 2>/dev/null
+    wait "$watchdog" 2>/dev/null
+    return "$exit_code"
+  }
+fi
 
 safe_jq() {
   local file="$1" query="$2" fallback="${3:-}"
@@ -86,7 +139,8 @@ safe_jq() {
 
 validate_numeric() {
   local value="$1" fallback="${2:-0}"
-  if [[ "$value" =~ ^-?[0-9]+\.?[0-9]*$ ]]; then
+  # Accept: 0, 1.5, .25 (bc output), -3.14
+  if [[ "$value" =~ ^-?[0-9]*\.?[0-9]+$ ]]; then
     echo "$value"
   else
     echo "$fallback"
@@ -97,12 +151,83 @@ extract_verdict() {
   sed -n 's/.*VERDICT: \([A-Z_]*\).*/\1/p' | tail -1
 }
 
+# Model selection: reads from pipeline.models.json
+get_model() {
+  local phase="$1" key
+  case "$phase" in
+    phase0) key="routing" ;;
+    interrogate|generate-docs*) key="generation" ;;
+    interrogation-review|doc-review|verify*|ship) key="review" ;;
+    implement*|security-fix) key="implementation" ;;
+    security-audit) key="security" ;;
+    holdout-generate) key="holdout_generate" ;;
+    holdout-validate) key="holdout_validate" ;;
+    write-specs) key="specification" ;;
+    *) key="" ;;
+  esac
+  if [ -n "$key" ] && [ -f "${SCRIPT_DIR}/pipeline.models.json" ]; then
+    safe_jq "${SCRIPT_DIR}/pipeline.models.json" ".overrides.${key}" \
+      "$(safe_jq "${SCRIPT_DIR}/pipeline.models.json" ".default" "claude-opus-4-6")"
+  else
+    echo "claude-opus-4-6"
+  fi
+}
+
+# Turn and budget lookups by phase category
+get_turns() {
+  case "$1" in
+    phase0|verify*) echo "${TURNS_QUICK:-15}" ;;
+    interrogate|generate-docs*|implement*) echo "${TURNS_LONG:-50}" ;;
+    *) echo "${TURNS_MEDIUM:-25}" ;;
+  esac
+}
+
+get_budget() {
+  case "$1" in
+    phase0|verify*|interrogation-review|doc-review|security-audit) echo "${BUDGET_LOW:-3}" ;;
+    interrogate|generate-docs*|implement*) echo "${BUDGET_HIGH:-10}" ;;
+    *) echo "${BUDGET_MEDIUM:-5}" ;;
+  esac
+}
+
+# Guard: ensure no threshold is zero
+for _t_var in THRESHOLD_AUTO_PASS THRESHOLD_PASS THRESHOLD_ITERATE THRESHOLD_DOC_REVIEW THRESHOLD_HOLDOUT; do
+  if [ "${!_t_var:-0}" -eq 0 ] 2>/dev/null; then
+    echo "[WARN] ${_t_var}=0 would break gates, setting to 60"
+    eval "${_t_var}=60"
+  fi
+done
+unset _t_var
+
 # ---- Arguments ----
 if [ -z "${1:-}" ]; then
-  echo "Usage: ./run-pipeline.sh TICKET-ID [--resume LOG_DIR]" >&2
+  echo "Usage: ./run-pipeline.sh TICKET-ID [--tier TIER] [--resume LOG_DIR]" >&2
   exit 1
 fi
 TICKET="$1"
+shift
+
+# Parse optional flags
+RESUME_FROM=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --tier)
+      [ -n "${2:-}" ] || { echo "[ERROR] --tier requires a value (guard|nano|quick|lite|standard|full)" >&2; exit 1; }
+      PIPELINE_TIER="$2"
+      shift 2
+      ;;
+    --resume)
+      [ -n "${2:-}" ] || { echo "[ERROR] --resume requires a LOG_DIR" >&2; exit 1; }
+      RESUME_FROM="$2"
+      shift 2
+      ;;
+    *)
+      echo "[ERROR] Unknown option: $1" >&2
+      exit 1
+      ;;
+  esac
+done
+
 DATE=$(date +%Y-%m-%d-%H%M)
 LOG_DIR="${LOG_BASE_DIR}/${DATE}"
 CHECKPOINT_FILE="${LOG_DIR}/checkpoint.json"
@@ -110,10 +235,8 @@ COST_LOG="${LOG_DIR}/costs.json"
 TOTAL_COST=0
 
 # ---- Resume Support (Step 6b) ----
-RESUME_FROM=""
-if [ "${2:-}" = "--resume" ] && [ -n "${3:-}" ]; then
-  RESUME_FROM="$3"
-  CHECKPOINT_DIR="$3"
+if [ -n "$RESUME_FROM" ]; then
+  CHECKPOINT_DIR="$RESUME_FROM"
   if [ -f "${CHECKPOINT_DIR}/checkpoint.json" ]; then
     RESUME_PHASE=$(safe_jq "${CHECKPOINT_DIR}/checkpoint.json" '.current_phase' "phase0")
     TOTAL_COST=$(safe_jq "${CHECKPOINT_DIR}/checkpoint.json" '.total_cost' "0")
@@ -226,11 +349,8 @@ should_run_phase() {
   if [ "$known" = false ]; then
     log_warn "Unknown phase name: $phase (not in PHASE_ORDER)"
   fi
-  if [ -z "$RESUME_FROM" ]; then
-    return 0  # Not resuming, run everything
-  fi
-  # Skip phases before the resume point
-  if [ -n "${RESUME_PHASE:-}" ]; then
+  # Skip phases before the resume point (only when resuming)
+  if [ -n "$RESUME_FROM" ] && [ -n "${RESUME_PHASE:-}" ]; then
     local reached_resume=false
     for p in "${PHASE_ORDER[@]}"; do
       if [ "$p" = "${RESUME_PHASE}" ]; then
@@ -245,12 +365,14 @@ should_run_phase() {
       fi
     done
   fi
-  # Also skip if this specific phase completed in the cost log
-  local completed
-  completed=$(safe_jq "$COST_LOG" ".phases[] | select(.name==\"$phase\") | .name" "")
-  if [ -n "$completed" ]; then
-    log "Skipping $phase (already completed in previous run)"
-    return 1
+  # Also skip if resuming and this specific phase completed in the cost log
+  if [ -n "$RESUME_FROM" ]; then
+    local completed
+    completed=$(safe_jq "$COST_LOG" ".phases[] | select(.name==\"$phase\") | .name" "")
+    if [ -n "$completed" ]; then
+      log "Skipping $phase (already completed in previous run)"
+      return 1
+    fi
   fi
   # Tier filtering
   if ! tier_allows_phase "$phase"; then
@@ -365,11 +487,12 @@ run_review_with_bias_check() {
 IMPORTANT: When evaluating sections, read them in REVERSE order (last section first). This reduces position bias."
 
   # Use a different model for pass 2 to maximize review diversity
-  local pass2_model
-  if [ "$model" = "$MODEL_REVIEW" ]; then
-    pass2_model="$MODEL_IMPLEMENT"  # Cross-model diversity: use Opus if pass 1 was Sonnet
+  local pass2_model review_model
+  review_model="$(get_model interrogation-review)"
+  if [ "$model" = "$review_model" ]; then
+    pass2_model="$(get_model implement)"  # Cross-model diversity: use Opus if pass 1 was Sonnet
   else
-    pass2_model="$MODEL_REVIEW"
+    pass2_model="$review_model"
   fi
   run_phase "${review_name}-pass2" "$swapped_prompt" "$max_turns" "$max_budget" "--model $pass2_model"
 
@@ -415,7 +538,7 @@ IMPORTANT: When evaluating sections, read them in REVERSE order (last section fi
 
 # ---- Graph-Based Routing (Step 6) ----
 # Route to the next phase based on gate verdict and retry count.
-# Follows the 5-step edge selection hierarchy from pipeline.graph.dot.
+# Follows the 5-step edge selection hierarchy.
 
 route_from_gate() {
   local gate="$1"
@@ -528,7 +651,7 @@ run_phase() {
 
   # Run Claude in headless mode with structured output (Step 8: wrapped with timeout)
   set +e
-  timeout "$phase_timeout" "$AGENT_COMMAND" -p "$prompt" \
+  _timeout "$phase_timeout" "$AGENT_COMMAND" -p "$prompt" \
     --output-format json \
     --max-turns "$max_turns" \
     --max-budget-usd "$max_budget" \
@@ -660,7 +783,7 @@ tier_allows_phase() {
       scope=$(safe_jq "${LOG_DIR}/phase0.json" '.result // ""' "" | sed -n 's/.*SCOPE: \([1-5]\).*/\1/p' | tail -1)
       scope=$(validate_numeric "$scope" "3")
       if [ "$scope" -le 1 ]; then RESOLVED_TIER="nano"
-      elif [ "$scope" -le 2 ]; then RESOLVED_TIER="quick"
+      elif [ "$scope" -le 2 ]; then RESOLVED_TIER="lite"
       elif [ "$scope" -le 3 ]; then RESOLVED_TIER="standard"
       else RESOLVED_TIER="full"
       fi
@@ -669,13 +792,22 @@ tier_allows_phase() {
   fi
 
   case "$RESOLVED_TIER" in
+    guard)
+      # Guard tier: context scan + security audit + ship only (validates existing code, no implementation)
+      case "$phase" in
+        interrogate|interrogation-review|generate-docs|doc-review|write-specs|holdout-generate|implement*|holdout-validate) return 1 ;;
+      esac ;;
     nano)
       case "$phase" in
-        interrogation-review|generate-docs|doc-review|write-specs|holdout-generate|holdout-validate|security-audit) return 1 ;;
+        interrogate|interrogation-review|generate-docs|doc-review|write-specs|holdout-generate|holdout-validate|security-audit) return 1 ;;
       esac ;;
     quick)
       case "$phase" in
         write-specs|holdout-generate|holdout-validate|security-audit) return 1 ;;
+      esac ;;
+    lite)
+      case "$phase" in
+        generate-docs|doc-review|interrogation-review|security-audit) return 1 ;;
       esac ;;
     standard)
       case "$phase" in
@@ -690,6 +822,7 @@ tier_allows_phase() {
 # PIPELINE EXECUTION
 # ============================================================
 
+log "Anvil v${ANVIL_VERSION:-unknown} - Autonomous Pipeline Runner"
 log "Starting autonomous pipeline for: $TICKET"
 if [ -n "$RESUME_FROM" ]; then
   log "Resuming from: $RESUME_FROM (phase: ${RESUME_PHASE:-unknown}, cost so far: \$${TOTAL_COST})"
@@ -713,7 +846,7 @@ After your scan, estimate the scope of the change on a 1-5 scale:
 Output SCOPE: N (where N is 1-5) in your response.
 
 Output must be under 20 lines." \
-    "$TURNS_PHASE0" "$BUDGET_PHASE0" "--model $MODEL_PHASE0"
+    "$(get_turns phase0)" "$(get_budget phase0)" "--model $(get_model phase0)"
 fi
 
 # ---- Stage 2: Self-Interrogation ----
@@ -737,7 +870,7 @@ Generate a pyramid summary to ${SUMMARIES_DIR}/interrogation-summary.md with:
   - Detailed: 50 lines (all requirements, one per line)
   - Assumptions: list all assumptions made with confidence level (high/medium/low)
 Update Memory MCP with pipeline_state=interrogated." \
-    "$TURNS_INTERROGATE" "$BUDGET_INTERROGATE" "--model $MODEL_INTERROGATE"
+    "$(get_turns interrogate)" "$(get_budget interrogate)" "--model $(get_model interrogate)"
 fi
 
 # ---- Stage 3: LLM-as-Judge Review of Interrogation (Step 14: bias check) ----
@@ -766,7 +899,7 @@ Otherwise: output VERDICT: ITERATE
 Always include VERDICT: [PASS|NEEDS_HUMAN|ITERATE] as the last line of your response."
 
   # Use bias-checked review for this high-stakes gate
-  VERDICT=$(run_review_with_bias_check "interrogation-review" "$REVIEW_PROMPT" "$TURNS_REVIEW" "$BUDGET_REVIEW" "$MODEL_REVIEW")
+  VERDICT=$(run_review_with_bias_check "interrogation-review" "$REVIEW_PROMPT" "$(get_turns interrogation-review)" "$(get_budget interrogation-review)" "$(get_model interrogation-review)")
   log "Interrogation review verdict: $VERDICT"
 
   NEXT=$(route_from_gate "interrogation-review" "$VERDICT")
@@ -781,7 +914,7 @@ Always include VERDICT: [PASS|NEEDS_HUMAN|ITERATE] as the last line of your resp
     log_warn "Interrogation needs iteration. Re-running with review feedback."
     run_phase "interrogate-v2" \
       "Re-run interrogation addressing the gaps identified in ${SUMMARIES_DIR}/interrogation-review.md. Focus on sections that scored below 3. Update ${SUMMARIES_DIR}/interrogation-summary.md and ${ARTIFACTS_DIR}/interrogation-${DATE}.md." \
-      "$TURNS_INTERROGATE" "$BUDGET_INTERROGATE" "--model $MODEL_INTERROGATE"
+      "$(get_turns interrogate)" "$(get_budget interrogate)" "--model $(get_model interrogate)"
   fi
 fi
 
@@ -792,7 +925,7 @@ if should_run_phase "generate-docs"; then
   if "$AGENT_COMMAND" --version 2>/dev/null | grep -q "agent-teams"; then
     run_phase "generate-docs-parallel" \
       "Run /parallel-docs to generate all documentation in parallel using Agent Teams. Read .claude/skills/parallel-docs/SKILL.md for the task breakdown." \
-      60 15 "--model $MODEL_GENERATE_DOCS"
+      60 15 "--model $(get_model generate-docs)"
   else
     # Fallback: sequential generation (bash backgrounding is unreliable for claude -p)
     # Sequential doc generation: Agent Teams not detected
@@ -843,7 +976,7 @@ Write each to docs/[name].md. For each doc:
 After all docs are written:
 1. Write ${SUMMARIES_DIR}/documentation-summary.md (pyramid format)
 2. Update Memory MCP with pipeline_state=documented" \
-      "$TURNS_GENERATE_DOCS" "$BUDGET_GENERATE_DOCS" "--model $MODEL_GENERATE_DOCS"
+      "$(get_turns generate-docs)" "$(get_budget generate-docs)" "--model $(get_model generate-docs)"
   fi
 fi
 
@@ -867,7 +1000,7 @@ If < 80%: VERDICT: ITERATE with specific fixes needed.
 
 Always include VERDICT: [PASS|ITERATE] as the last line."
 
-  DOC_VERDICT=$(run_review_with_bias_check "doc-review" "$DOC_REVIEW_PROMPT" "$TURNS_REVIEW" "$BUDGET_REVIEW" "$MODEL_REVIEW")
+  DOC_VERDICT=$(run_review_with_bias_check "doc-review" "$DOC_REVIEW_PROMPT" "$(get_turns doc-review)" "$(get_budget doc-review)" "$(get_model doc-review)")
   log "Doc review verdict: $DOC_VERDICT"
 
   DOC_NEXT=$(route_from_gate "doc-review" "$DOC_VERDICT")
@@ -875,7 +1008,7 @@ Always include VERDICT: [PASS|ITERATE] as the last line."
     log_warn "Doc review needs iteration. Re-running doc generation with feedback."
     run_phase "generate-docs-v2" \
       "Re-generate docs addressing the gaps identified in ${SUMMARIES_DIR}/ review files. Focus on sections flagged as incomplete or contradictory." \
-      "$TURNS_GENERATE_DOCS" "$BUDGET_GENERATE_DOCS" "--model $MODEL_GENERATE_DOCS"
+      "$(get_turns generate-docs)" "$(get_budget generate-docs)" "--model $(get_model generate-docs)"
   fi
 fi
 
@@ -896,7 +1029,7 @@ For each step in IMPLEMENTATION_PLAN.md:
 
 You must NOT write any implementation code. Only tests. Only RED.
 Write a summary to ${SUMMARIES_DIR}/write-specs-summary.md listing each spec file and what it tests." \
-    "$TURNS_WRITE_SPECS" "$BUDGET_WRITE_SPECS" "--model $MODEL_WRITE_SPECS"
+    "$(get_turns write-specs)" "$(get_budget write-specs)" "--model $(get_model write-specs)"
 fi
 
 # ---- Stage 5c: Auto-Generate Holdouts (Step 16) ----
@@ -921,7 +1054,7 @@ Generate 8-12 adversarial test scenarios that:
 
 Write each to ${HOLDOUTS_DIR}/holdout-NNN-[slug].md using the standard format.
 Start numbering at 001." \
-      "$TURNS_HOLDOUT_GENERATE" "$BUDGET_HOLDOUT_GENERATE" "--model $MODEL_HOLDOUT_GENERATE"
+      "$(get_turns holdout-generate)" "$(get_budget holdout-generate)" "--model $(get_model holdout-generate)"
   fi
 fi
 
@@ -950,8 +1083,10 @@ if should_run_phase "implement"; then
   fi
 
   if [ "$STEP_COUNT" -eq 0 ]; then
-    log_error "No implementation steps found. Check docs/IMPLEMENTATION_PLAN.md exists and has steps."
-    exit 1
+    # Lightweight tiers may not have an implementation plan — create a single-step plan from the ticket
+    log "No implementation plan found. Creating single-step plan from ticket description."
+    IMPL_STEPS='[{"id":"step-1","title":"Implement ticket requirements","description":"Read the ticket description and implement all required changes. Run existing tests to verify."}]'
+    STEP_COUNT=1
   fi
 
   for i in $(seq 0 $((STEP_COUNT - 1))); do
@@ -1003,7 +1138,7 @@ ${ERROR_CONTEXT}
 ${BDD_PROMPT}
 After implementation, run the project's type checker and linter to verify your changes compile.
 Commit your changes with message: 'feat(${STEP_ID}): ${STEP_TITLE}'" \
-        "$TURNS_IMPLEMENT" "$BUDGET_IMPLEMENT" "--model $MODEL_IMPLEMENT"
+        "$(get_turns implement)" "$(get_budget implement)" "--model $(get_model implement)"
 
       # Track git progress after implementation
       after_phase "implement-${STEP_ID}-attempt-${attempt}"
@@ -1024,7 +1159,7 @@ If ALL pass: output VERDICT: PASS
 If ANY fail: output VERDICT: FAIL with the specific error (first 50 lines only)
 
 Always include VERDICT: [PASS|FAIL] as the last line." \
-          "$TURNS_VERIFY" "$BUDGET_VERIFY" "--model $MODEL_VERIFY"
+          "$(get_turns verify)" "$(get_budget verify)" "--model $(get_model verify)"
       else
         # Final attempt: full test suite
         run_phase "verify-${STEP_ID}-attempt-${attempt}" \
@@ -1040,7 +1175,7 @@ If ALL pass: output VERDICT: PASS
 If ANY fail: output VERDICT: FAIL with the specific error (first 50 lines only)
 
 Always include VERDICT: [PASS|FAIL] as the last line." \
-          "$TURNS_VERIFY" "$BUDGET_VERIFY" "--model $MODEL_VERIFY"
+          "$(get_turns verify)" "$(get_budget verify)" "--model $(get_model verify)"
       fi
       set -e
 
@@ -1093,7 +1228,7 @@ If >= 80% and 0 anti-pattern flags: VERDICT: PASS
 If < 80% or any anti-pattern flags: VERDICT: FAIL with details.
 
 Always include VERDICT: [PASS|FAIL] as the last line." \
-      "$TURNS_HOLDOUT_VALIDATE" "$BUDGET_HOLDOUT_VALIDATE" "--model $MODEL_HOLDOUT_VALIDATE"
+      "$(get_turns holdout-validate)" "$(get_budget holdout-validate)" "--model $(get_model holdout-validate)"
 
     HOLDOUT_VERDICT=$(jq -r '.result // ""' "${LOG_DIR}/holdout-validate.json" 2>/dev/null | extract_verdict)
     HOLDOUT_VERDICT="${HOLDOUT_VERDICT:-UNKNOWN}"
@@ -1130,7 +1265,7 @@ If 0 BLOCKERs: VERDICT: PASS
 If any BLOCKERs: VERDICT: FAIL with file:line and description
 
 Always include VERDICT: [PASS|FAIL] as the last line." \
-    "$TURNS_SECURITY" "$BUDGET_SECURITY" "--model $MODEL_SECURITY"
+    "$(get_turns security-audit)" "$(get_budget security-audit)" "--model $(get_model security-audit)"
 
   SECURITY_VERDICT=$(jq -r '.result // ""' "${LOG_DIR}/security-audit.json" 2>/dev/null | extract_verdict)
   SECURITY_VERDICT="${SECURITY_VERDICT:-UNKNOWN}"
@@ -1140,7 +1275,7 @@ Always include VERDICT: [PASS|FAIL] as the last line." \
     log_warn "Security audit found blockers. Attempting auto-fix."
     run_phase "security-fix" \
       "Read ${ARTIFACTS_DIR}/pipeline-runs/${DATE}/security-audit.json. Fix all BLOCKER-severity issues. Do not change functionality, only fix security issues. Commit with message 'fix(security): address audit findings'" \
-      "$TURNS_IMPLEMENT" "$BUDGET_IMPLEMENT" "--model $MODEL_IMPLEMENT"
+      "$(get_turns implement)" "$(get_budget implement)" "--model $(get_model security-fix)"
     after_phase "security-fix"
   fi
 fi
@@ -1165,7 +1300,7 @@ Push branch and create PR via gh CLI or GitHub MCP.
 Update Memory MCP: pipeline_state=shipped
 
 Output the PR URL as the last line." \
-    "$TURNS_SHIP" "$BUDGET_SHIP" "--model $MODEL_SHIP"
+    "$(get_turns ship)" "$(get_budget ship)" "--model $(get_model ship)"
 fi
 
 # ---- Final Cost Report ----

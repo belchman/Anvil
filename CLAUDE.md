@@ -1,6 +1,8 @@
-# Interrogation Protocol v3.0
+# Anvil — Pipeline Framework for Claude Code
 
-**Read CONTRIBUTING_AGENT.md for the development process.** It governs all work in this repository.
+Anvil enforces spec-before-code discipline on autonomous Claude Code sessions. 20 config variables, 6 tiers ($1-$50), external validator hooks. Deploy ~30 core files into any project. Benchmark suite: 10 tickets, 2 targets, automated scorer (zero LLM). 192 self-tests pass.
+
+**Read CONTRIBUTING_AGENT.md for the development process.**
 
 ## Quick Reference
 - Autonomous: `./run-pipeline.sh TICKET-ID`

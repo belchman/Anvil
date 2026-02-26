@@ -1,0 +1,47 @@
+{
+  "ticket": "BENCH-9",
+  "description": "Security audit — fix all input validation gaps",
+  "checks": [
+    {
+      "type": "ast_parse",
+      "file": "invtrack/orders.py",
+      "weight": 5
+    },
+    {
+      "type": "grep_present",
+      "file": "invtrack/orders.py",
+      "pattern": "(if\\s+.*percent\\s*[<>]|if\\s+not\\s+0\\s*<=|raise\\s+ValueError.*percent|raise\\s+ValueError.*discount)",
+      "description": "Discount validation in orders.py",
+      "weight": 15
+    },
+    {
+      "type": "grep_present",
+      "file": "invtrack/models.py",
+      "pattern": "(validate|ValueError|\\bif\\b.*price|\\bif\\b.*quantity|__post_init__)",
+      "description": "Validation logic in models.py",
+      "weight": 15
+    },
+    {
+      "type": "grep_absent_all",
+      "glob": "invtrack/*.py",
+      "pattern": "# BUG",
+      "description": "All BUG comments removed (bugs fixed)",
+      "weight": 10
+    },
+    {
+      "type": "pytest",
+      "weight": 30
+    },
+    {
+      "type": "test_count_minimum",
+      "minimum": 18,
+      "weight": 15
+    },
+    {
+      "type": "pytest_count_files",
+      "minimum": 3,
+      "description": "At least 3 test files",
+      "weight": 10
+    }
+  ]
+}
