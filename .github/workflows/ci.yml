@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Unit tests
+        run: cargo test
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: anvil-linux
+          path: target/release/anvil
+
+  self-test:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: anvil-linux
+          path: ./bin
+
+      - name: Make executable
+        run: chmod +x ./bin/anvil
+
+      - name: Setup Python (for benchmark targets)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install pytest
+        run: pip install pytest
+
+      - name: Run self-test suite
+        run: ./bin/anvil test --quick
+
+      - name: Verify MCP server responds
+        run: |
+          echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"ci","version":"1.0"}}}' \
+            | ./bin/anvil serve 2>/dev/null \
+            | python3 -c "import sys,json; r=json.load(sys.stdin); assert r['result']['serverInfo']['name']=='anvil', 'MCP init failed'"
+
+      - name: Dry-run benchmark
+        run: ./bin/anvil bench --dry-run --target target-hard
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt -- --check
+
+      - name: Clippy
+        run: cargo clippy -- -D warnings

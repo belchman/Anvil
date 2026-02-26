@@ -84,7 +84,7 @@ echo ""
 echo "--- Anti-Patterns ---"
 
 check "no eval with user input" \
-  bash -c '! grep -rn "eval.*\$[{(]" "$1" --include="*.sh" --exclude-dir=".git" 2>/dev/null | grep -v "pipeline.config.sh" | grep -q .' "$ROOT"
+  bash -c '! grep -rn "eval.*\$[{(]" "$1" --include="*.sh" --exclude-dir=".git" 2>/dev/null | grep -q .' "$ROOT"
 
 warn_check "no TODO/FIXME/HACK in committed code" \
   bash -c '! grep -rni "TODO\|FIXME\|HACK\|XXX" "$1" --include="*.sh" --include="*.py" --exclude-dir=".git" --exclude="review-validator.sh" 2>/dev/null | grep -q .' "$ROOT"
@@ -93,8 +93,8 @@ warn_check "no TODO/FIXME/HACK in committed code" \
 echo ""
 echo "--- Tests ---"
 
-if [ -f "$ROOT/scripts/test-anvil.sh" ]; then
-  check "self-test suite passes" "$ROOT/scripts/test-anvil.sh"
+if command -v anvil >/dev/null 2>&1; then
+  check "self-test suite passes" anvil test --quick
 fi
 
 if [ -f "$ROOT/scripts/agent-test.sh" ]; then

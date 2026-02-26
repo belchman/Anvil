@@ -10,7 +10,7 @@ Comprehensive requirements gathering across 13 sections. This is the CORE of the
 
 ## Mode Detection
 - **INTERACTIVE** (default): Ask the human each question. Wait for answers. Confirm MCP-sourced data.
-- **AUTONOMOUS** (when AUTONOMOUS_MODE=true or running via run-pipeline.sh): No human available. For each question: SEARCH MCP sources -> INFER from codebase -> ASSUME with [ASSUMPTION] tags.
+- **AUTONOMOUS** (when AUTONOMOUS_MODE=true or running via `anvil run`): No human available. For each question: SEARCH MCP sources -> INFER from codebase -> ASSUME with [ASSUMPTION] tags.
 
 ## Pre-Interrogation
 1. Read `docs/summaries/phase0-summary.md` for project context

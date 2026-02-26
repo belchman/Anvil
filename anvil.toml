@@ -1,0 +1,76 @@
+# Anvil Pipeline Configuration
+# Single source of truth for all pipeline configuration.
+#
+# ESSENTIAL (start here):
+#   [anvil] tier       - auto|full|standard|lite|quick|nano|guard
+#   [budget] max_pipeline_cost - hard ceiling on total spend per run (USD)
+#   agent_command      - CLI command for the AI agent (default: "claude")
+#
+# TUNE FOR COST (reduce spend):
+#   [budget]           - per-category dollar caps
+#   [turns]            - per-category turn limits
+#
+# TUNE FOR QUALITY:
+#   [quality]          - pass thresholds and retry limits
+#
+# CLI flags and env vars always override values in this file.
+
+[anvil]
+version = "4.0.0"
+tier = "auto"
+agent_command = "claude"
+
+[turns]
+quick = 15       # phase0, verify
+medium = 30      # reviews, holdout, write-specs, ship, security
+long = 50        # interrogate, generate-docs, implement
+
+[budget]
+max_pipeline_cost = 50.0
+low = 3.0        # phase0, verify, reviews
+medium = 5.0     # holdout, write-specs, ship
+high = 10.0      # interrogate, generate-docs, implement
+
+[quality]
+max_verify_retries = 3
+threshold_auto_pass = 0.95
+threshold_pass = 0.80
+threshold_iterate = 0.60
+threshold_holdout = 0.80
+validator = "./scripts/review-validator.sh"
+
+[watchdog]
+inactivity_timeout = 120
+max_restarts = 2
+stagnation_similarity = 0.90
+
+[paths]
+log_base_dir = "docs/artifacts/pipeline-runs"
+kill_switch_file = ".pipeline-kill"
+
+[models]
+default = "claude-opus-4-6"
+
+[models.roles]
+routing = "claude-sonnet-4-5-20250929"
+review = "claude-sonnet-4-5-20250929"
+security = "claude-sonnet-4-5-20250929"
+generation = "claude-opus-4-6"
+implementation = "claude-opus-4-6"
+specification = "claude-sonnet-4-5-20250929"
+holdout_generate = "claude-opus-4-6"
+holdout_validate = "claude-sonnet-4-5-20250929"
+healer = "claude-opus-4-6"
+supervisor = "claude-sonnet-4-5-20250929"
+
+[models.cost_weights]
+"claude-opus-4-6" = 1.0
+"claude-sonnet-4-5-20250929" = 0.2
+
+# Per-phase timeout overrides (seconds).
+# Phases not listed here use the default timeout from the harness.
+[timeouts]
+default = 600
+# phase0 = 120
+# interrogate = 300
+# implement = 600

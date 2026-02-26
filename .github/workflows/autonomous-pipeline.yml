@@ -8,6 +8,10 @@ on:
       ticket:
         description: 'Ticket ID or feature description'
         required: true
+      tier:
+        description: 'Pipeline tier'
+        required: false
+        default: 'auto'
       node_version:
         description: 'Node.js version to use'
         required: false
@@ -20,6 +24,7 @@ on:
 env:
   TRIGGER_LABEL: agent-ready
   DEFAULT_NODE_VERSION: '20'
+  CARGO_TERM_COLOR: always
 
 permissions:
   contents: write
@@ -35,6 +40,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build Anvil
+        run: cargo build --release
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -48,16 +61,11 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "ticket=${{ github.event.inputs.ticket }}" >> $GITHUB_OUTPUT
+            echo "tier=${{ github.event.inputs.tier || 'auto' }}" >> $GITHUB_OUTPUT
           else
             echo "ticket=${{ github.event.issue.number }}" >> $GITHUB_OUTPUT
+            echo "tier=auto" >> $GITHUB_OUTPUT
           fi
-
-      - name: Load pipeline config
-        id: config
-        run: |
-          # Extract LOG_BASE_DIR from pipeline.config.sh
-          LOG_BASE_DIR=$(grep '^LOG_BASE_DIR=' pipeline.config.sh | cut -d'"' -f2)
-          echo "log_base_dir=${LOG_BASE_DIR:-docs/artifacts/pipeline-runs}" >> $GITHUB_OUTPUT
 
       - name: Run pipeline
         env:
@@ -66,12 +74,12 @@ jobs:
           AUTONOMOUS_MODE: true
           MAX_PIPELINE_COST: 50
         run: |
-          chmod +x run-pipeline.sh
-          ./run-pipeline.sh "${{ steps.ticket.outputs.ticket }}"
+          ./target/release/anvil run "${{ steps.ticket.outputs.ticket }}" \
+            --tier ${{ steps.ticket.outputs.tier }}
 
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: pipeline-logs
-          path: ${{ steps.config.outputs.log_base_dir }}/
+          path: docs/artifacts/pipeline-runs/

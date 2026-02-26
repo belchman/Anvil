@@ -14,7 +14,7 @@ globs: ["**/*"]
 - When in doubt about scope, treat it as out of scope until confirmed.
 - "I think" and "probably" are red flags. Replace with "I need to confirm" and ask.
 
-## Autonomous Mode (activated when AUTONOMOUS_MODE=true or running via run-pipeline.sh)
+## Autonomous Mode (activated when AUTONOMOUS_MODE=true or running via `anvil run`)
 When no human is available to answer questions:
 1. SEARCH first: query all MCP sources (Jira, Confluence, Slack, Drive, codebase)
 2. INFER second: use codebase patterns, industry conventions, and related context

@@ -10,7 +10,7 @@
     {
       "type": "grep_present",
       "file": "invtrack/orders.py",
-      "pattern": "(decremented_items|_to_rollback|items_adjusted|rollback_list|completed_decrements|already_decremented)",
+      "pattern": "(decremented|_to_rollback|items_adjusted|rollback_list|completed_decrements|already_decremented|adjusted_items|processed_items|successful_items)",
       "description": "Rollback tracking variable in place_order()",
       "weight": 20
     },

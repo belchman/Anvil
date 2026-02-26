@@ -33,7 +33,7 @@ Gather all failure data:
 Spawn the `healer` agent (via Task tool with `subagent_type: "healer"`) with this context:
 - All collected error evidence (summarized, not raw -- follow compaction rules)
 - Current rules from `.claude/rules/`
-- Current pipeline config from `pipeline.config.sh`
+- Current pipeline config from `anvil.toml`
 
 The healer agent runs its 7-step cycle:
 1. **OBSERVE**: Read pipeline logs
@@ -69,7 +69,7 @@ Write `docs/artifacts/heal-report-[date].md` with:
 
 ## Safety Rules
 - The healer fixes the PIPELINE, not the TARGET PROJECT
-- Only modify: `.claude/rules/`, `.claude/skills/`, `pipeline.config.sh`, `run-pipeline.sh`, `scripts/`
+- Only modify: `.claude/rules/`, `.claude/skills/`, `anvil.toml`, `src/`, `scripts/`
 - Never modify: `docs/templates/`, target project source code, `.holdouts/`
 - Never increase budget ceilings without flagging it
 - If a prescription requires architectural changes, flag it as `[NEEDS_HUMAN]` instead of applying

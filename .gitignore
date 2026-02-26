@@ -37,3 +37,8 @@ node_modules/
 .idea/
 *.swp
 *.swo
+
+
+# Added by cargo
+
+/target

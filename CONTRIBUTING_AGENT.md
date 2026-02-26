@@ -19,10 +19,10 @@ Always run from the repository root.
 
 ```bash
 # Autonomous mode
-./run-pipeline.sh "TICKET-ID"
+anvil run "TICKET-ID"
 
 # Resume a previous run
-./run-pipeline.sh "TICKET-ID" --resume docs/artifacts/pipeline-runs/2026-02-23-1430
+anvil run "TICKET-ID" --resume docs/artifacts/pipeline-runs/2026-02-23-1430
 
 # Interactive mode
 claude
@@ -45,23 +45,22 @@ Tiers control which phases run, balancing cost against rigor:
 | standard | $20-30 | + doc generation + reviews | Most feature work |
 | full | $40-50 | + security audit + dual-pass review | Production, security-sensitive changes |
 
-Set `PIPELINE_TIER` in `pipeline.config.sh` or let auto-detection handle it. Default: `auto` (phase0 estimates scope 1-5, maps to tier).
+Set `PIPELINE_TIER` in `anvil.toml` or let auto-detection handle it. Default: `auto` (phase0 estimates scope 1-5, maps to tier).
 
 ## Phase Order
 
 `phase0` → `interrogate` → `interrogation-review` → `generate-docs` → `doc-review` → `write-specs` → `holdout-generate` → `implement` → `holdout-validate` → `security-audit` → `ship`
 
-Phase ordering is defined in `PHASE_ORDER` in `pipeline.config.sh`.
+Phase ordering is defined in the pipeline orchestrator.
 
 ## Configuration
 
-`pipeline.config.sh` is the single source of configuration. All thresholds, timeouts, models, budgets, and paths live there.
+`anvil.toml` is the single source of configuration. All thresholds, timeouts, models, budgets, and paths live there.
 
 When adding a new config variable:
-1. Add it to `pipeline.config.sh` with a comment
-2. Numeric validation and test suite auto-discover from `pipeline.config.sh`
-3. Use it via `${VAR_NAME}` (bash) or `_config.get("VAR_NAME", default)` (Python)
-4. String configs use naming convention `*_DIR`, `*_FILE`, `*_ORDER`, or `*_COMMAND` to skip numeric validation
+1. Add it to `anvil.toml` with a comment
+2. Add corresponding field to `src/config.rs`
+3. Use TOML section naming: `[anvil]`, `[turns]`, `[budget]`, `[quality]`, `[watchdog]`, `[paths]`, `[models]`, `[timeouts]`
 
 ## Cross-Model BDD
 
@@ -126,8 +125,8 @@ Context windows are finite. The pipeline manages them explicitly:
 - No `grep -oP` (not portable to macOS/BSD)
 - No hardcoded paths when config variables exist
 - TTY-aware colors with `if [ -t 1 ]` checks
-- All config centralized in `pipeline.config.sh`
-- Validate with `scripts/test-anvil.sh` (192 checks, zero failures required)
+- All config centralized in `anvil.toml`
+- Validate with `anvil test` (131 checks, zero failures required)
 
 ## Commit Discipline
 
